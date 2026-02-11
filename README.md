@@ -193,9 +193,17 @@ If you want semantic notes after each click (recommended for tricky date picker)
 python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
 ```
 
-The script records every click and asks you in terminal:
-- label (for example `BOOKING_PARAMS_OPEN_SELECTOR`)
-- note (what this click means)
+The script runs guided mode by default:
+- label names are predefined automatically,
+- you only click in browser and confirm in terminal,
+- optional note can be entered in plain language.
+
+Useful commands in terminal:
+- `Enter` save step,
+- `r` retry step,
+- `s` skip step,
+- `b` go back one step,
+- `q` finish.
 
 Outputs:
 - `artifacts/selector_annotations.json`
