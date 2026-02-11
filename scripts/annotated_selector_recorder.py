@@ -1,19 +1,18 @@
 """
-Simple free-form Playwright click recorder.
+Robust click recorder for unstable terminals.
 
-Flow:
-1) Run script, browser opens.
-2) Click element in browser.
-3) In terminal press Enter.
-4) Script shows captured selector and asks:
-   - "What did you do?" (free text)
-   - optional short label (can be empty)
-5) Repeat.
-6) Type q in terminal to finish.
+Usage:
+  python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
+
+How it works:
+1) Script opens browser and records all clicks automatically.
+2) You DO NOT type in terminal while browser is open.
+3) When finished, close browser window.
+4) Script saves raw clicks and optionally asks for notes in terminal.
 
 Outputs:
 - artifacts/selector_annotations.json
-- artifacts/selector_annotations.env (only from uppercase labels)
+- artifacts/selector_annotations.env
 """
 
 from __future__ import annotations
@@ -152,6 +151,7 @@ INJECT_SCRIPT = r"""
 
 @dataclass
 class CaptureItem:
+    index: int
     ts: str
     url: str
     selector: str
@@ -215,29 +215,56 @@ def _pump_records(
         pending.extend(rows)
 
 
-def _wait_for_record(
-    context: BrowserContext,
-    offsets: dict[int, int],
-    pending: list[dict],
-) -> dict:
+def _capture_until_browser_closed(context: BrowserContext) -> list[dict]:
+    offsets: dict[int, int] = {}
+    pending: list[dict] = []
+    captured: list[dict] = []
+    last_printed_count = -1
+
+    print("Recorder started.")
+    print("Do clicks in browser. Do NOT type in terminal now.")
+    print("When finished, close all browser windows.")
+
     while True:
         _pump_records(context, offsets, pending)
-        if pending:
-            return pending.pop(0)
+        while pending:
+            captured.append(pending.pop(0))
+
+        if len(captured) != last_printed_count:
+            print(f"Captured clicks: {len(captured)}")
+            last_printed_count = len(captured)
+
+        alive_pages = [p for p in context.pages if not p.is_closed()]
+        if not alive_pages:
+            break
         time.sleep(0.2)
 
+    return captured
 
-def _print_record(rec: dict, index: int) -> None:
-    print("")
-    print(f"[{index}] Click captured")
-    print(f"URL:      {rec.get('url', '')}")
-    print(f"Selector: {rec.get('selector', '')}")
-    print(f"Text:     {rec.get('text', '')}")
-    print(f"Tag:      {rec.get('tag', '')}")
-    print(
-        "Offset:   "
-        f"x={int(rec.get('offsetX', 0))}, y={int(rec.get('offsetY', 0))}"
-    )
+
+def _annotate_after_capture(items: list[CaptureItem]) -> None:
+    if not items:
+        return
+    answer = input("Add notes now? [y/N]: ").strip().lower()
+    if answer not in {"y", "yes"}:
+        return
+
+    print("For each click you can enter:")
+    print("- note: what you did")
+    print("- optional label: UPPER_CASE (example BOOKING_PARAMS_OPEN_SELECTOR)")
+    print("Type s to skip current click.")
+
+    for item in items:
+        print("")
+        print(f"[{item.index}] {item.url}")
+        print(f"Selector: {item.selector}")
+        print(f"Text: {item.text}")
+        print(f"Tag: {item.tag}")
+        cmd = input("Note (or s=skip): ").strip()
+        if cmd.lower() == "s":
+            continue
+        item.note = cmd
+        item.label = input("Optional label: ").strip()
 
 
 def _build_env_lines(items: list[CaptureItem]) -> list[str]:
@@ -268,58 +295,6 @@ def _build_env_lines(items: list[CaptureItem]) -> list[str]:
     return lines
 
 
-def _capture_loop(context: BrowserContext) -> list[CaptureItem]:
-    offsets: dict[int, int] = {}
-    pending: list[dict] = []
-    out: list[CaptureItem] = []
-    index = 1
-
-    print("Simple recorder started.")
-    print("Do action in browser -> press Enter in terminal -> write note.")
-    print("Commands:")
-    print("  Enter: capture next click")
-    print("  p: show number of pending clicks")
-    print("  q: finish")
-
-    while True:
-        cmd = input("\nCommand [Enter/p/q]: ").strip().lower()
-        if cmd == "q":
-            break
-        if cmd == "p":
-            _pump_records(context, offsets, pending)
-            print(f"Pending clicks: {len(pending)}")
-            continue
-
-        rec = _wait_for_record(context, offsets, pending)
-        _print_record(rec, index)
-        note = input("What did you do? ").strip()
-        label = input("Optional label (empty if you do not need it): ").strip()
-
-        out.append(
-            CaptureItem(
-                ts=str(rec.get("ts", "")),
-                url=str(rec.get("url", "")),
-                selector=str(rec.get("selector", "")),
-                text=str(rec.get("text", "")),
-                tag=str(rec.get("tag", "")),
-                role=str(rec.get("role", "")),
-                placeholder=str(rec.get("placeholder", "")),
-                class_name=str(rec.get("className", "")),
-                click_x=float(rec.get("clickX", 0.0)),
-                click_y=float(rec.get("clickY", 0.0)),
-                click_offset_x=float(rec.get("offsetX", 0.0)),
-                click_offset_y=float(rec.get("offsetY", 0.0)),
-                note=note,
-                label=label,
-                recorded_at_utc=datetime.now(timezone.utc).isoformat(),
-            )
-        )
-        print("Saved.")
-        index += 1
-
-    return out
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -335,7 +310,7 @@ def main() -> int:
     parser.add_argument(
         "--env-output",
         default="artifacts/selector_annotations.env",
-        help="ENV output path (only uppercase labels).",
+        help="ENV output path (from optional labels).",
     )
     args = parser.parse_args()
 
@@ -344,7 +319,7 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     env_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    items: list[CaptureItem] = []
+    raw_records: list[dict] = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context()
@@ -354,11 +329,36 @@ def main() -> int:
         _ensure_injected(page)
 
         try:
-            items = _capture_loop(context)
+            raw_records = _capture_until_browser_closed(context)
         except KeyboardInterrupt:
-            print("\nInterrupted. Saving collected data.")
+            print("\nInterrupted.")
         finally:
             browser.close()
+
+    items: list[CaptureItem] = []
+    for i, rec in enumerate(raw_records, start=1):
+        items.append(
+            CaptureItem(
+                index=i,
+                ts=str(rec.get("ts", "")),
+                url=str(rec.get("url", "")),
+                selector=str(rec.get("selector", "")),
+                text=str(rec.get("text", "")),
+                tag=str(rec.get("tag", "")),
+                role=str(rec.get("role", "")),
+                placeholder=str(rec.get("placeholder", "")),
+                class_name=str(rec.get("className", "")),
+                click_x=float(rec.get("clickX", 0.0)),
+                click_y=float(rec.get("clickY", 0.0)),
+                click_offset_x=float(rec.get("offsetX", 0.0)),
+                click_offset_y=float(rec.get("offsetY", 0.0)),
+                note="",
+                label="",
+                recorded_at_utc=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+
+    _annotate_after_capture(items)
 
     output_path.write_text(
         json.dumps([asdict(item) for item in items], ensure_ascii=False, indent=2),
@@ -368,7 +368,7 @@ def main() -> int:
 
     print(f"\nSaved annotations: {output_path}")
     print(f"Saved env lines:   {env_output_path}")
-    print("Send me file content and I will map selectors to project config.")
+    print("Send me selector_annotations.json; I will map steps and update project.")
     return 0
 
 
