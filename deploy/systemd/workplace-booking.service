@@ -1,0 +1,10 @@
+[Unit]
+Description=Workplace booking bot (single run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/workplace_booking
+ExecStart=/usr/bin/docker compose run --rm workplace-booking
+

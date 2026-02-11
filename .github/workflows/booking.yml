@@ -1,0 +1,66 @@
+name: workplace-booking
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  run-booking:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run booking
+        env:
+          BOOKING_URL: ${{ secrets.BOOKING_URL }}
+          USERNAME: ${{ secrets.USERNAME }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          TARGET_OFFICE: ${{ secrets.TARGET_OFFICE }}
+          TARGET_SEAT: ${{ secrets.TARGET_SEAT }}
+          HEADLESS: "true"
+          DEFAULT_TIMEOUT_MS: ${{ secrets.DEFAULT_TIMEOUT_MS }}
+          UI_PAUSE_MS: ${{ secrets.UI_PAUSE_MS }}
+          RETRY_ATTEMPTS: ${{ secrets.RETRY_ATTEMPTS }}
+          RETRY_DELAY_SEC: ${{ secrets.RETRY_DELAY_SEC }}
+          RUN_MODE: "once"
+          PAGE_READY_SELECTOR: ${{ secrets.PAGE_READY_SELECTOR }}
+          LOGIN_USERNAME_SELECTORS: ${{ secrets.LOGIN_USERNAME_SELECTORS }}
+          LOGIN_PASSWORD_SELECTORS: ${{ secrets.LOGIN_PASSWORD_SELECTORS }}
+          LOGIN_SUBMIT_SELECTORS: ${{ secrets.LOGIN_SUBMIT_SELECTORS }}
+          LOGIN_SUCCESS_SELECTOR: ${{ secrets.LOGIN_SUCCESS_SELECTOR }}
+          OFFICE_OPEN_SELECTOR: ${{ secrets.OFFICE_OPEN_SELECTOR }}
+          OFFICE_OPTION_SELECTOR_TEMPLATE: ${{ secrets.OFFICE_OPTION_SELECTOR_TEMPLATE }}
+          SEAT_SEARCH_SELECTOR: ${{ secrets.SEAT_SEARCH_SELECTOR }}
+          SEAT_SELECTOR_TEMPLATE: ${{ secrets.SEAT_SELECTOR_TEMPLATE }}
+          BOOK_BUTTON_SELECTOR: ${{ secrets.BOOK_BUTTON_SELECTOR }}
+          BOOK_BUTTON_TEXTS: ${{ secrets.BOOK_BUTTON_TEXTS }}
+          SUCCESS_SELECTOR: ${{ secrets.SUCCESS_SELECTOR }}
+          SUCCESS_TEXT: ${{ secrets.SUCCESS_TEXT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOG_LEVEL: "INFO"
+        run: python -m booking_bot
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: booking-screenshots
+          path: .state/screenshots
+          if-no-files-found: ignore
+          retention-days: 7
+

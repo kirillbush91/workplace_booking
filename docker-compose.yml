@@ -1,0 +1,11 @@
+services:
+  workplace-booking:
+    build: .
+    container_name: workplace-booking
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.state:/app/.state
+    command: ["python", "-m", "booking_bot"]
+
