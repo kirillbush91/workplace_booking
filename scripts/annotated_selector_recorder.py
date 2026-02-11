@@ -1,15 +1,15 @@
 """
-Simple inline click recorder.
+Annotated selector recorder with in-page overlay.
 
 Usage:
   python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
 
 Flow:
 1) Browser opens.
-2) You click one element in browser.
-3) Browser asks annotation via prompt ("What did you do?").
-4) Repeat.
-5) Finish by closing browser or typing /q in annotation prompt.
+2) Click an element in the page.
+3) Overlay panel appears in the same page with click details.
+4) Add free-text note and press Save (or Skip).
+5) Press Finish in overlay when done.
 
 Outputs:
 - artifacts/selector_annotations.json
@@ -33,9 +33,10 @@ INJECT_SCRIPT = r"""
 (() => {
   if (window.__annSelectorInstalled) return;
   window.__annSelectorInstalled = true;
-  window.__annSelectorRecords = [];
-  window.__annSelectorStop = false;
 
+  const STATE_PREFIX = "__annSelectorState:";
+  const STYLE_ID = "__ann_selector_style";
+  const PANEL_ID = "__ann_selector_panel";
   const IGNORE_CLASS_PREFIXES = ["ant-", "css-", "sc-", "rc-", "react-", "__"];
   const MAX_TEXT_LENGTH = 120;
 
@@ -127,24 +128,297 @@ INJECT_SCRIPT = r"""
     return parts.join(" > ") || base || "*";
   }
 
+  function parsePersistedState() {
+    const raw = window.name || "";
+    if (!raw.startsWith(STATE_PREFIX)) return null;
+    const encoded = raw.slice(STATE_PREFIX.length);
+    try {
+      const parsed = JSON.parse(decodeURIComponent(encoded));
+      if (!parsed || typeof parsed !== "object") return null;
+      return parsed;
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function normalizeState(state) {
+    const out = state && typeof state === "object" ? state : {};
+    return {
+      prevWindowName: typeof out.prevWindowName === "string" ? out.prevWindowName : "",
+      records: Array.isArray(out.records) ? out.records : [],
+      pending: out.pending && typeof out.pending === "object" ? out.pending : null,
+      stop: !!out.stop,
+    };
+  }
+
+  const persisted = parsePersistedState();
+  const state = normalizeState(
+    persisted ||
+      {
+        prevWindowName: window.name || "",
+        records: [],
+        pending: null,
+        stop: false,
+      }
+  );
+
+  function syncGlobals() {
+    window.__annSelectorRecords = state.records;
+    window.__annSelectorPending = state.pending;
+    window.__annSelectorStop = state.stop;
+  }
+
+  function persistState() {
+    const payload = {
+      prevWindowName: state.prevWindowName,
+      records: state.records,
+      pending: state.pending,
+      stop: state.stop,
+    };
+    window.name = STATE_PREFIX + encodeURIComponent(JSON.stringify(payload));
+    syncGlobals();
+  }
+
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+      #${PANEL_ID} {
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        width: min(460px, calc(100vw - 24px));
+        background: rgba(17, 24, 39, 0.97);
+        color: #f8fafc;
+        z-index: 2147483647;
+        border-radius: 10px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+        font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        padding: 10px;
+      }
+      #${PANEL_ID} .ann-title {
+        font-weight: 700;
+        margin-bottom: 6px;
+      }
+      #${PANEL_ID} .ann-muted {
+        color: #cbd5e1;
+      }
+      #${PANEL_ID} .ann-row {
+        margin-top: 6px;
+      }
+      #${PANEL_ID} code {
+        display: block;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 80px;
+        overflow: auto;
+        margin-top: 2px;
+        padding: 4px 6px;
+        border-radius: 6px;
+        background: rgba(15, 23, 42, 0.95);
+      }
+      #${PANEL_ID} textarea {
+        width: 100%;
+        min-height: 72px;
+        resize: vertical;
+        border: 1px solid #475569;
+        border-radius: 8px;
+        background: #0f172a;
+        color: #f8fafc;
+        padding: 8px;
+        margin-top: 6px;
+        box-sizing: border-box;
+      }
+      #${PANEL_ID} .ann-actions {
+        display: flex;
+        gap: 8px;
+        margin-top: 8px;
+      }
+      #${PANEL_ID} button {
+        border: 1px solid #64748b;
+        border-radius: 8px;
+        background: #1e293b;
+        color: #f8fafc;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      #${PANEL_ID} button.ann-primary {
+        background: #0f766e;
+        border-color: #14b8a6;
+      }
+      #${PANEL_ID} button.ann-danger {
+        background: #7f1d1d;
+        border-color: #ef4444;
+      }
+      #${PANEL_ID} .ann-hidden {
+        display: none;
+      }
+    `;
+    document.documentElement.appendChild(style);
+  }
+
+  function ensurePanel() {
+    let panel = document.getElementById(PANEL_ID);
+    if (panel) return panel;
+
+    panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.innerHTML = `
+      <div class="ann-title">Selector Recorder</div>
+      <div class="ann-muted" id="__ann_status"></div>
+      <div id="__ann_idle_block" class="ann-row">
+        Click target in page. Then add a note and press Save.
+      </div>
+      <div id="__ann_pending_block" class="ann-hidden">
+        <div class="ann-row">
+          URL
+          <code id="__ann_url"></code>
+        </div>
+        <div class="ann-row">
+          Selector
+          <code id="__ann_selector"></code>
+        </div>
+        <div class="ann-row">
+          Text
+          <code id="__ann_text"></code>
+        </div>
+        <div class="ann-row">
+          Note
+          <textarea id="__ann_note" placeholder="Example: clicked date picker opener"></textarea>
+        </div>
+      </div>
+      <div class="ann-actions">
+        <button type="button" class="ann-primary" id="__ann_save">Save</button>
+        <button type="button" id="__ann_skip">Skip</button>
+        <button type="button" class="ann-danger" id="__ann_finish">Finish</button>
+      </div>
+    `;
+
+    document.documentElement.appendChild(panel);
+
+    const saveButton = panel.querySelector("#__ann_save");
+    const skipButton = panel.querySelector("#__ann_skip");
+    const finishButton = panel.querySelector("#__ann_finish");
+    const noteInput = panel.querySelector("#__ann_note");
+
+    saveButton.addEventListener("click", () => {
+      if (!state.pending) return;
+      const note = String(noteInput.value || "").trim();
+      const rec = Object.assign({}, state.pending, { note });
+      state.records.push(rec);
+      state.pending = null;
+      noteInput.value = "";
+      persistState();
+      renderPanel();
+      console.log(`[recorder] saved #${state.records.length}: ${rec.selector}`);
+    });
+
+    skipButton.addEventListener("click", () => {
+      if (!state.pending) return;
+      state.pending = null;
+      noteInput.value = "";
+      persistState();
+      renderPanel();
+      console.log("[recorder] pending click skipped");
+    });
+
+    finishButton.addEventListener("click", () => {
+      state.stop = true;
+      persistState();
+      renderPanel();
+      console.log("[recorder] finish requested");
+    });
+
+    noteInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        saveButton.click();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        skipButton.click();
+      }
+    });
+
+    panel.addEventListener("click", (event) => {
+      event.stopPropagation();
+    }, true);
+    panel.addEventListener("mousedown", (event) => {
+      event.stopPropagation();
+    }, true);
+    panel.addEventListener("mouseup", (event) => {
+      event.stopPropagation();
+    }, true);
+
+    return panel;
+  }
+
+  let lastFocusedPendingId = "";
+
+  function renderPanel() {
+    ensureStyle();
+    const panel = ensurePanel();
+    const statusEl = panel.querySelector("#__ann_status");
+    const idleBlock = panel.querySelector("#__ann_idle_block");
+    const pendingBlock = panel.querySelector("#__ann_pending_block");
+    const urlEl = panel.querySelector("#__ann_url");
+    const selectorEl = panel.querySelector("#__ann_selector");
+    const textEl = panel.querySelector("#__ann_text");
+    const noteInput = panel.querySelector("#__ann_note");
+    const saveButton = panel.querySelector("#__ann_save");
+    const skipButton = panel.querySelector("#__ann_skip");
+
+    statusEl.textContent = state.stop
+      ? `Finished. Captured: ${state.records.length}.`
+      : `Captured: ${state.records.length}.`;
+
+    const hasPending = !!state.pending;
+    idleBlock.classList.toggle("ann-hidden", hasPending);
+    pendingBlock.classList.toggle("ann-hidden", !hasPending);
+
+    if (state.stop) {
+      panel.style.opacity = "0.88";
+      saveButton.disabled = true;
+      skipButton.disabled = true;
+    } else {
+      panel.style.opacity = "1";
+      saveButton.disabled = !hasPending;
+      skipButton.disabled = !hasPending;
+    }
+
+    if (!hasPending) return;
+
+    const pending = state.pending;
+    urlEl.textContent = String(pending.url || "");
+    selectorEl.textContent = String(pending.selector || "");
+    textEl.textContent = String(pending.text || "");
+
+    if (pending.recId && pending.recId !== lastFocusedPendingId) {
+      lastFocusedPendingId = pending.recId;
+      setTimeout(() => {
+        noteInput.focus();
+        noteInput.select();
+      }, 0);
+    }
+  }
+
   document.addEventListener("click", (event) => {
+    if (state.stop) return;
+    const panel = document.getElementById(PANEL_ID);
+    if (panel && panel.contains(event.target)) return;
+    if (state.pending) return;
+
     const el = event.target;
     if (!el || !el.tagName) return;
+
     const rect = el.getBoundingClientRect();
-    const selector = uniqueSelector(el);
-    const text = textSnippet(el);
-    const annotation = window.prompt(
-      "What did you do?\\nType /q to finish recording.",
-      ""
-    );
-    if (annotation !== null && annotation.trim() === "/q") {
-      window.__annSelectorStop = true;
-    }
-    const rec = {
+    state.pending = {
+      recId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       ts: new Date().toISOString(),
       url: location.href,
-      selector: selector,
-      text: text,
+      selector: uniqueSelector(el),
+      text: textSnippet(el),
       tag: (el.tagName || "").toLowerCase(),
       role: el.getAttribute("role") || "",
       placeholder: el.getAttribute("placeholder") || "",
@@ -153,10 +427,17 @@ INJECT_SCRIPT = r"""
       clickY: Number(event.clientY || 0),
       offsetX: Number((event.clientX || 0) - rect.left),
       offsetY: Number((event.clientY || 0) - rect.top),
-      note: annotation == null ? "" : String(annotation)
+      note: "",
     };
-    window.__annSelectorRecords.push(rec);
+
+    persistState();
+    renderPanel();
   }, true);
+
+  syncGlobals();
+  persistState();
+  renderPanel();
+  console.log("[recorder] overlay ready. Click element, annotate in panel, press Save.");
 })();
 """
 
@@ -164,6 +445,7 @@ INJECT_SCRIPT = r"""
 @dataclass
 class CaptureItem:
     index: int
+    rec_id: str
     ts: str
     url: str
     selector: str
@@ -187,48 +469,40 @@ def _ensure_injected(page: Page) -> None:
         pass
 
 
-def _drain_new_records(page: Page, offset: int) -> tuple[list[dict], int]:
+def _read_snapshot(page: Page) -> dict | None:
     try:
-        total = page.evaluate("() => (window.__annSelectorRecords || []).length")
-    except Exception:
-        return [], offset
-
-    if not isinstance(total, int):
-        return [], offset
-    if total < offset:
-        offset = 0
-
-    try:
-        rows = page.evaluate(
-            "(start) => (window.__annSelectorRecords || []).slice(start)",
-            offset,
+        snapshot = page.evaluate(
+            """() => ({
+                records: Array.isArray(window.__annSelectorRecords) ? window.__annSelectorRecords : [],
+                stop: !!window.__annSelectorStop,
+                pending: window.__annSelectorPending || null
+            })"""
         )
     except Exception:
-        return [], offset
+        return None
 
-    if not isinstance(rows, list):
-        return [], offset
-    return rows, offset + len(rows)
+    if not isinstance(snapshot, dict):
+        return None
+    return snapshot
 
 
-def _pump_records(
-    context: BrowserContext,
-    offsets: dict[int, int],
-    pending: list[dict],
-) -> None:
-    pages = [p for p in context.pages if not p.is_closed()]
-    for page in pages:
-        _ensure_injected(page)
-        pid = id(page)
-        offset = offsets.get(pid, 0)
-        rows, new_offset = _drain_new_records(page, offset)
-        offsets[pid] = new_offset
-        pending.extend(rows)
+def _record_identity(rec: dict) -> str:
+    rec_id = rec.get("recId")
+    if isinstance(rec_id, str) and rec_id:
+        return rec_id
+    parts = [
+        str(rec.get("ts", "")),
+        str(rec.get("url", "")),
+        str(rec.get("selector", "")),
+        str(rec.get("clickX", "")),
+        str(rec.get("clickY", "")),
+    ]
+    return "|".join(parts)
 
 
 def _print_record(rec: dict, index: int) -> None:
     print("")
-    print(f"[{index}] Click captured")
+    print(f"[{index}] Click saved")
     print(f"URL:      {rec.get('url', '')}")
     print(f"Selector: {rec.get('selector', '')}")
     print(f"Text:     {rec.get('text', '')}")
@@ -240,63 +514,77 @@ def _print_record(rec: dict, index: int) -> None:
     print(f"Note:     {rec.get('note', '')}")
 
 
-def _is_stop_requested(context: BrowserContext) -> bool:
-    pages = [p for p in context.pages if not p.is_closed()]
-    for page in pages:
-        try:
-            flag = page.evaluate("() => !!window.__annSelectorStop")
-            if flag:
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _capture_with_inline_annotations(context: BrowserContext) -> list[CaptureItem]:
-    offsets: dict[int, int] = {}
-    pending: list[dict] = []
+def _capture_with_overlay(context: BrowserContext) -> list[CaptureItem]:
     out: list[CaptureItem] = []
+    seen_ids: set[str] = set()
     index = 1
+    waiting_pending_hint_shown = False
 
     print("Recorder started.")
-    print("Click in browser and annotate directly in browser prompt.")
-    print("Finish: close browser or type /q in browser prompt.")
+    print("Use page overlay: click element, add note, press Save.")
+    print("Press Finish in overlay when done.")
 
     while True:
-        _pump_records(context, offsets, pending)
-
-        while pending:
-            rec = pending.pop(0)
-            _print_record(rec, index)
-
-            out.append(
-                CaptureItem(
-                    index=index,
-                    ts=str(rec.get("ts", "")),
-                    url=str(rec.get("url", "")),
-                    selector=str(rec.get("selector", "")),
-                    text=str(rec.get("text", "")),
-                    tag=str(rec.get("tag", "")),
-                    role=str(rec.get("role", "")),
-                    placeholder=str(rec.get("placeholder", "")),
-                    class_name=str(rec.get("className", "")),
-                    click_x=float(rec.get("clickX", 0.0)),
-                    click_y=float(rec.get("clickY", 0.0)),
-                    click_offset_x=float(rec.get("offsetX", 0.0)),
-                    click_offset_y=float(rec.get("offsetY", 0.0)),
-                    note=str(rec.get("note", "")),
-                    recorded_at_utc=datetime.now(timezone.utc).isoformat(),
-                )
-            )
-            index += 1
-
-        if _is_stop_requested(context):
-            break
-
-        alive_pages = [p for p in context.pages if not p.is_closed()]
+        alive_pages = [page for page in context.pages if not page.is_closed()]
         if not alive_pages:
             break
-        time.sleep(0.2)
+
+        stop_requested = False
+        pending_present = False
+
+        for page in alive_pages:
+            _ensure_injected(page)
+            snapshot = _read_snapshot(page)
+            if snapshot is None:
+                continue
+
+            records = snapshot.get("records", [])
+            if isinstance(records, list):
+                for rec in records:
+                    if not isinstance(rec, dict):
+                        continue
+                    rec_key = _record_identity(rec)
+                    if rec_key in seen_ids:
+                        continue
+                    seen_ids.add(rec_key)
+                    _print_record(rec, index)
+                    out.append(
+                        CaptureItem(
+                            index=index,
+                            rec_id=str(rec.get("recId", "")),
+                            ts=str(rec.get("ts", "")),
+                            url=str(rec.get("url", "")),
+                            selector=str(rec.get("selector", "")),
+                            text=str(rec.get("text", "")),
+                            tag=str(rec.get("tag", "")),
+                            role=str(rec.get("role", "")),
+                            placeholder=str(rec.get("placeholder", "")),
+                            class_name=str(rec.get("className", "")),
+                            click_x=float(rec.get("clickX", 0.0)),
+                            click_y=float(rec.get("clickY", 0.0)),
+                            click_offset_x=float(rec.get("offsetX", 0.0)),
+                            click_offset_y=float(rec.get("offsetY", 0.0)),
+                            note=str(rec.get("note", "")),
+                            recorded_at_utc=datetime.now(timezone.utc).isoformat(),
+                        )
+                    )
+                    index += 1
+
+            if snapshot.get("pending") is not None:
+                pending_present = True
+            if bool(snapshot.get("stop")):
+                stop_requested = True
+
+        if pending_present and not waiting_pending_hint_shown:
+            print("Pending click detected: add note in overlay and press Save/Skip.")
+            waiting_pending_hint_shown = True
+        if not pending_present:
+            waiting_pending_hint_shown = False
+
+        if stop_requested:
+            break
+
+        time.sleep(0.25)
 
     return out
 
@@ -346,7 +634,7 @@ def main() -> int:
     parser.add_argument(
         "--env-output",
         default="artifacts/selector_annotations.env",
-        help="ENV output path (from optional labels).",
+        help="ENV output path (from notes that match ENV_KEY style).",
     )
     args = parser.parse_args()
 
@@ -365,7 +653,7 @@ def main() -> int:
         _ensure_injected(page)
 
         try:
-            items = _capture_with_inline_annotations(context)
+            items = _capture_with_overlay(context)
         except KeyboardInterrupt:
             print("\nInterrupted.")
         finally:

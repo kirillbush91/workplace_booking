@@ -194,12 +194,14 @@ python scripts/annotated_selector_recorder.py --url "https://lemana.simple-offic
 ```
 
 Simple mode:
-- click in browser,
-- browser prompt immediately asks for free-text note,
-- repeat for next click.
+- click element in browser,
+- write note in overlay panel (bottom-right),
+- press `Save`,
+- repeat.
 
-Useful commands in terminal:
-- To finish, type `/q` in browser prompt (or close browser).
+Finish:
+- press `Finish` in overlay panel (or close browser).
+- `Ctrl+Enter` in note field = quick save.
 
 Outputs:
 - `artifacts/selector_annotations.json`
