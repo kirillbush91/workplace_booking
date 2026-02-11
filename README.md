@@ -151,7 +151,8 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_PARAMS_OPEN_SELECTOR`: open booking parameters panel on map page.
 - `BOOKING_DATE_INPUT_SELECTOR`: date input in booking parameters.
 - If `BOOKING_PARAMS_OPEN_SELECTOR` fails, bot now tries a date-like text fallback automatically.
-- `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: optional fallback selector for day cell (supports `{day}`).
+- `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: selector template for day cell (supports `{day}`), used before generic fallbacks.
+- `BOOKING_CALENDAR_NEXT_SELECTOR`: optional selector for "next month" control in non-standard calendars.
 - `BOOKING_RANGE_DAYS`: date range size from today (default `7`, inclusive).
 - `BOOKING_INCLUDE_TODAY`: include current day in range.
 - `BOOKING_SKIP_WEEKENDS`: optional weekend skip in range mode.

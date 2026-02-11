@@ -682,11 +682,14 @@ class BookingBot:
         return False
 
     async def _calendar_next_month(self, page: Page) -> bool:
-        selectors = [
+        selectors: list[str] = []
+        if self.settings.booking_calendar_next_selector:
+            selectors.append(self.settings.booking_calendar_next_selector)
+        selectors.extend([
             ".ant-picker-dropdown .ant-picker-header-next-btn",
             ".ant-picker-panel .ant-picker-header-next-btn",
             "[class*=\"calendar\"] [aria-label*=\"next\"]",
-        ]
+        ])
         for selector in selectors:
             locator = page.locator(selector).first
             try:
@@ -724,6 +727,20 @@ class BookingBot:
 
     async def _click_calendar_day_with_fallback(self, page: Page, day: int) -> bool:
         day_str = str(day)
+        if self.settings.booking_date_day_selector_template:
+            try:
+                selector = self.settings.booking_date_day_selector_template.format(
+                    day=day_str
+                )
+                locator = page.locator(selector).first
+                await locator.wait_for(state="visible", timeout=3_500)
+                await self._click_locator(page, locator)
+                return True
+            except PlaywrightTimeoutError:
+                pass
+            except Exception:
+                pass
+
         selectors = [
             ".ant-picker-dropdown .ant-picker-cell:not(.ant-picker-cell-disabled):not(.ant-picker-cell-in-view-false) "
             f".ant-picker-cell-inner:has-text(\"{day_str}\")",

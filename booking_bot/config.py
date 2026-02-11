@@ -120,6 +120,7 @@ class Settings:
     booking_params_close_selector: str | None
     booking_date_input_selector: str | None
     booking_date_day_selector_template: str | None
+    booking_calendar_next_selector: str | None
     booking_date_value: str | None
     booking_date_offset_days: int | None
     booking_range_days: int
@@ -237,6 +238,9 @@ class Settings:
             booking_date_input_selector=_env_optional("BOOKING_DATE_INPUT_SELECTOR"),
             booking_date_day_selector_template=_env_optional(
                 "BOOKING_DATE_DAY_SELECTOR_TEMPLATE"
+            ),
+            booking_calendar_next_selector=_env_optional(
+                "BOOKING_CALENDAR_NEXT_SELECTOR"
             ),
             booking_date_value=_env_optional("BOOKING_DATE_VALUE"),
             booking_date_offset_days=_env_optional_int(
