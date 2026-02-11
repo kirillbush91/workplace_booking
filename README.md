@@ -148,6 +148,7 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `OFFICE_MAP_LOADING_WAIT_TIMEOUT_MS`: max wait for loader disappearance.
 - `BOOKING_PARAMS_OPEN_SELECTOR`: open booking parameters panel on map page.
 - `BOOKING_DATE_INPUT_SELECTOR`: date input in booking parameters.
+- If `BOOKING_PARAMS_OPEN_SELECTOR` fails, bot now tries a date-like text fallback automatically.
 - `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: optional fallback selector for day cell (supports `{day}`).
 - `BOOKING_TYPE_SELECTOR`: booking type chooser opener.
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.

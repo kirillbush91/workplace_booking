@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
+import re
 from time import monotonic
 
 from playwright.async_api import (
@@ -315,6 +316,9 @@ class BookingBot:
                     "Booking params opener did not respond, trying direct controls: %s",
                     exc,
                 )
+                opened = await self._try_open_date_picker_by_text(page)
+                if opened:
+                    LOGGER.info("Booking params/date picker opened by fallback text search.")
 
         target_date = self._resolve_booking_date()
         if self.settings.booking_date_input_selector and target_date:
@@ -340,7 +344,12 @@ class BookingBot:
                         ),
                     )
                 else:
-                    await self._click_text_exact(page, str(target_day))
+                    clicked = await self._click_calendar_day_with_fallback(page, target_day)
+                    if not clicked:
+                        raise RuntimeError(
+                            f"Failed to click calendar day '{target_day}'. "
+                            "Set BOOKING_DATE_DAY_SELECTOR_TEMPLATE to explicit selector."
+                        )
 
         if self.settings.booking_type_selector and (
             self.settings.booking_type_option_selector or self.settings.booking_type_value
@@ -460,6 +469,55 @@ class BookingBot:
         locator = page.get_by_text(text, exact=True).first
         await locator.wait_for(state="visible", timeout=wait_timeout)
         await self._click_locator(page, locator)
+
+    async def _try_open_date_picker_by_text(self, page: Page) -> bool:
+        # Handles localized labels like "Ср, 11 февраля" and similar variants.
+        date_like_patterns = [
+            re.compile(
+                r"\b\d{1,2}\s+"
+                r"(янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек)",
+                re.IGNORECASE,
+            ),
+            re.compile(r"\b\d{1,2}[./-]\d{1,2}\b"),
+        ]
+        for pattern in date_like_patterns:
+            locator = page.get_by_text(pattern).first
+            try:
+                await locator.wait_for(state="visible", timeout=5_000)
+                await self._click_locator(page, locator)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+        return False
+
+    async def _click_calendar_day_with_fallback(self, page: Page, day: int) -> bool:
+        day_str = str(day)
+        selectors = [
+            ".ant-picker-dropdown .ant-picker-cell:not(.ant-picker-cell-disabled) "
+            f".ant-picker-cell-inner:has-text(\"{day_str}\")",
+            ".ant-picker-panel .ant-picker-cell:not(.ant-picker-cell-disabled) "
+            f".ant-picker-cell-inner:has-text(\"{day_str}\")",
+            f"[class*=\"calendar\"] [class*=\"day\"]:has-text(\"{day_str}\")",
+        ]
+
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=3_500)
+                await self._click_locator(page, locator)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+
+        try:
+            await self._click_text_exact(page, day_str, timeout_ms=3_500)
+            return True
+        except Exception:
+            return False
 
     async def _fill_input_like_user(self, page: Page, selector: str, value: str) -> None:
         locator = page.locator(selector).first
