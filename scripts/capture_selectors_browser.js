@@ -1,14 +1,20 @@
 /*
 Usage (Chrome/Edge DevTools):
-1) Open booking page in browser and login manually if needed.
+1) Open page in browser.
 2) Open DevTools Console.
 3) Paste full script and run.
 4) Start guided flow:
    __bookingCapture.lemana()
-5) For each step: Ctrl+Shift+Click target element.
-6) Print ready env block:
+5) On each step do Ctrl+Shift+Click target.
+6) Confirm captured selector:
+   __bookingCapture.ok()
+   If wrong:
+   __bookingCapture.retry()
+   If need go one step back:
+   __bookingCapture.back()
+7) Print env block:
    __bookingCapture.env()
-7) Stop:
+8) Stop:
    __bookingCapture.stop()
 */
 
@@ -20,19 +26,23 @@ Usage (Chrome/Edge DevTools):
   const LEMANA_FLOW = [
     {
       label: "LOGIN_SSO_BUTTON_SELECTOR",
-      hint: "On login page click SSO entry button.",
+      hint: "Login page: click SSO entry button.",
     },
     {
       label: "LOGIN_SUBMIT_SELECTOR",
-      hint: "On identity provider page click submit button.",
+      hint: "Identity provider page: click submit/login button.",
+    },
+    {
+      label: "OTP_CODE_INPUT_SELECTOR",
+      hint: "OTP page: click one-time code input (or first OTP digit input).",
     },
     {
       label: "OFFICE_CHOOSE_SELECTOR",
-      hint: "On /offices page click choose button for required office.",
+      hint: "/offices page: click choose button for required office.",
     },
     {
       label: "BOOKING_PARAMS_OPEN_SELECTOR",
-      hint: "On map page click booking parameters panel opener.",
+      hint: "Map page: click booking parameters panel opener.",
     },
     {
       label: "BOOKING_DATE_INPUT_SELECTOR",
@@ -171,7 +181,25 @@ Usage (Chrome/Edge DevTools):
     flow: null,
     flowIndex: -1,
     prevWindowName: "",
+    pendingCapture: null,
   };
+
+  function currentFlowStep() {
+    if (!state.flow) return null;
+    if (state.flowIndex < 0 || state.flowIndex >= state.flow.length) return null;
+    return state.flow[state.flowIndex];
+  }
+
+  function serializeState() {
+    return {
+      prevWindowName: state.prevWindowName || "",
+      records: state.records || {},
+      flowKind: state.flow ? "lemana" : null,
+      flowIndex: state.flow ? state.flowIndex : -1,
+      activeLabel: state.activeLabel || null,
+      pendingCapture: state.pendingCapture || null,
+    };
+  }
 
   function parsePersistedWindowName() {
     const raw = window.name || "";
@@ -191,14 +219,8 @@ Usage (Chrome/Edge DevTools):
       (current && typeof current.prevWindowName === "string"
         ? current.prevWindowName
         : "");
-
-    const payload = {
-      prevWindowName,
-      records: state.records || {},
-      flowKind: state.flow ? "lemana" : null,
-      flowIndex: state.flow ? state.flowIndex : -1,
-      activeLabel: state.activeLabel || null,
-    };
+    const payload = serializeState();
+    payload.prevWindowName = prevWindowName;
     window.name = STATE_PREFIX + encodeURIComponent(JSON.stringify(payload));
   }
 
@@ -220,6 +242,10 @@ Usage (Chrome/Edge DevTools):
     state.records = persisted.records && typeof persisted.records === "object"
       ? persisted.records
       : {};
+    state.pendingCapture =
+      persisted.pendingCapture && typeof persisted.pendingCapture === "object"
+        ? persisted.pendingCapture
+        : null;
 
     if (persisted.flowKind === "lemana" && Number.isInteger(persisted.flowIndex)) {
       state.flow = LEMANA_FLOW;
@@ -234,22 +260,32 @@ Usage (Chrome/Edge DevTools):
         );
         console.log(`[capture] ${step.hint}`);
       }
-      return true;
+    } else {
+      state.flow = null;
+      state.flowIndex = -1;
+      state.activeLabel = persisted.activeLabel || null;
     }
 
-    state.flow = null;
-    state.flowIndex = -1;
-    state.activeLabel = persisted.activeLabel || null;
-    if (state.activeLabel) {
-      console.log(`[capture] Restored active label: ${state.activeLabel}`);
+    if (state.pendingCapture) {
+      console.log(
+        `[capture] Pending selector for ${state.pendingCapture.label}: ${state.pendingCapture.selector}`
+      );
+      console.log("[capture] Confirm: __bookingCapture.ok() or retry: __bookingCapture.retry()");
     }
     return true;
   }
 
-  function currentFlowStep() {
-    if (!state.flow) return null;
-    if (state.flowIndex < 0 || state.flowIndex >= state.flow.length) return null;
-    return state.flow[state.flowIndex];
+  function printStepPrompt() {
+    const step = currentFlowStep();
+    if (!step) {
+      console.log("[capture] No active step.");
+      return;
+    }
+    console.log(
+      `[capture] Step ${state.flowIndex + 1}/${state.flow.length}: ${step.label}`
+    );
+    console.log(`[capture] ${step.hint}`);
+    console.log("[capture] Do Ctrl+Shift+Click then confirm with __bookingCapture.ok()");
   }
 
   function startFlow(flow) {
@@ -258,13 +294,12 @@ Usage (Chrome/Edge DevTools):
     }
     state.flow = flow;
     state.flowIndex = 0;
+    state.pendingCapture = null;
     const step = currentFlowStep();
     if (!step) return;
     state.activeLabel = step.label;
     savePersistedState();
-    console.log(`[capture] Flow started. Step 1/${flow.length}: ${step.label}`);
-    console.log(`[capture] ${step.hint}`);
-    console.log("[capture] Do Ctrl+Shift+Click on target element.");
+    printStepPrompt();
   }
 
   function nextFlowStep() {
@@ -281,11 +316,7 @@ Usage (Chrome/Edge DevTools):
     }
     state.activeLabel = step.label;
     savePersistedState();
-    console.log(
-      `[capture] Next step ${state.flowIndex + 1}/${state.flow.length}: ${step.label}`
-    );
-    console.log(`[capture] ${step.hint}`);
-    console.log("[capture] Do Ctrl+Shift+Click on target element.");
+    printStepPrompt();
   }
 
   function selectorOf(label) {
@@ -301,13 +332,58 @@ Usage (Chrome/Edge DevTools):
     next(label) {
       state.flow = null;
       state.flowIndex = -1;
+      state.pendingCapture = null;
       state.activeLabel = label;
       savePersistedState();
       console.log(`[capture] Waiting for Ctrl+Shift+Click for "${label}".`);
+      console.log("[capture] Confirm with __bookingCapture.ok()");
     },
 
     lemana() {
       startFlow(LEMANA_FLOW);
+    },
+
+    ok() {
+      if (!state.pendingCapture) {
+        console.log("[capture] Nothing to confirm.");
+        return;
+      }
+      const pending = state.pendingCapture;
+      state.records[pending.label] = pending.record;
+      state.pendingCapture = null;
+      console.log(`[capture] Confirmed ${pending.label}: ${pending.selector}`);
+
+      if (state.flow && state.activeLabel === pending.label) {
+        nextFlowStep();
+      } else {
+        state.activeLabel = null;
+        savePersistedState();
+      }
+    },
+
+    retry() {
+      if (!state.pendingCapture) {
+        console.log("[capture] No pending capture. Click target first.");
+        return;
+      }
+      const label = state.pendingCapture.label;
+      state.pendingCapture = null;
+      state.activeLabel = label;
+      savePersistedState();
+      console.log(`[capture] Retry ${label}. Do Ctrl+Shift+Click again.`);
+    },
+
+    back() {
+      if (!state.flow) {
+        console.log("[capture] Back works only in flow mode.");
+        return;
+      }
+      state.pendingCapture = null;
+      state.flowIndex = Math.max(0, state.flowIndex - 1);
+      const step = currentFlowStep();
+      state.activeLabel = step ? step.label : null;
+      savePersistedState();
+      printStepPrompt();
     },
 
     skip() {
@@ -316,6 +392,7 @@ Usage (Chrome/Edge DevTools):
         console.log("[capture] No active flow step.");
         return;
       }
+      state.pendingCapture = null;
       state.records[step.label] = {
         selector: "",
         text: "",
@@ -325,12 +402,12 @@ Usage (Chrome/Edge DevTools):
         placeholder: "",
         skipped: true,
       };
-      savePersistedState();
       console.log(`[capture] Skipped ${step.label}`);
       nextFlowStep();
     },
 
     set(label, selector) {
+      state.pendingCapture = null;
       state.records[label] = {
         selector,
         text: "",
@@ -349,18 +426,29 @@ Usage (Chrome/Edge DevTools):
       state.records = {};
       state.flow = null;
       state.flowIndex = -1;
+      state.pendingCapture = null;
       clearPersistedState();
       console.log("[capture] Reset done. Run __bookingCapture.lemana()");
     },
 
     show() {
       const step = currentFlowStep();
-      if (!step) {
-        console.log("[capture] No active step.");
-        return null;
+      if (step) {
+        console.log(`[capture] Current step: ${step.label} - ${step.hint}`);
+      } else {
+        console.log(`[capture] Active label: ${state.activeLabel || "(none)"}`);
       }
-      console.log(`[capture] Current: ${step.label} - ${step.hint}`);
-      return step;
+      if (state.pendingCapture) {
+        console.log(
+          `[capture] Pending ${state.pendingCapture.label}: ${state.pendingCapture.selector}`
+        );
+      }
+      return {
+        flowIndex: state.flowIndex,
+        flowLength: state.flow ? state.flow.length : 0,
+        activeLabel: state.activeLabel,
+        pending: state.pendingCapture,
+      };
     },
 
     dump() {
@@ -373,6 +461,7 @@ Usage (Chrome/Edge DevTools):
     env() {
       const ssoSelector = selectorOf("LOGIN_SSO_BUTTON_SELECTOR");
       const submitSelector = selectorOf("LOGIN_SUBMIT_SELECTOR");
+      const otpSelector = selectorOf("OTP_CODE_INPUT_SELECTOR");
       const seatRaw = selectorOf("SEAT_SELECTOR_TEMPLATE");
       const seatTemplate = templateSeatSelector(seatRaw);
       const lines = [
@@ -380,6 +469,7 @@ Usage (Chrome/Edge DevTools):
         `LOGIN_SUBMIT_SELECTORS=${
           submitSelector || 'button[type="submit"]|button:has-text("Sign in")'
         }`,
+        `OTP_CODE_INPUT_SELECTOR=${otpSelector}`,
         `OFFICE_CHOOSE_SELECTOR=${selectorOf("OFFICE_CHOOSE_SELECTOR")}`,
         `BOOKING_PARAMS_OPEN_SELECTOR=${selectorOf("BOOKING_PARAMS_OPEN_SELECTOR")}`,
         `BOOKING_DATE_INPUT_SELECTOR=${selectorOf("BOOKING_DATE_INPUT_SELECTOR")}`,
@@ -409,6 +499,7 @@ Usage (Chrome/Edge DevTools):
       state.activeLabel = null;
       state.flow = null;
       state.flowIndex = -1;
+      state.pendingCapture = null;
       clearPersistedState();
       console.log("[capture] Stopped.");
     },
@@ -418,29 +509,27 @@ Usage (Chrome/Edge DevTools):
     if (!state.activeLabel) return;
     if (!(event.ctrlKey && event.shiftKey)) return;
 
-    event.preventDefault();
-    event.stopPropagation();
-
     const el = event.target;
     const selector = uniqueSelector(el);
     const text = textSnippet(el);
 
-    state.records[state.activeLabel] = {
+    state.pendingCapture = {
+      label: state.activeLabel,
       selector,
-      text,
-      tag: (el.tagName || "").toLowerCase(),
-      role: el.getAttribute("role") || "",
-      className: el.className || "",
-      placeholder: el.getAttribute("placeholder") || "",
+      record: {
+        selector,
+        text,
+        tag: (el.tagName || "").toLowerCase(),
+        role: el.getAttribute("role") || "",
+        className: el.className || "",
+        placeholder: el.getAttribute("placeholder") || "",
+      },
     };
     savePersistedState();
 
-    console.log(`[capture] Saved ${state.activeLabel}: ${selector}`);
-    if (state.flow) nextFlowStep();
-    else {
-      state.activeLabel = null;
-      savePersistedState();
-    }
+    console.log(`[capture] Captured ${state.activeLabel}: ${selector}`);
+    console.log("[capture] Confirm with __bookingCapture.ok()");
+    console.log("[capture] Wrong target? Use __bookingCapture.retry()");
   };
 
   document.addEventListener("click", state.handler, true);
@@ -451,6 +540,7 @@ Usage (Chrome/Edge DevTools):
     state.prevWindowName = window.name || "";
   }
   console.log(
-    "[capture] If page/domain changed: paste script again, state is auto-restored."
+    "[capture] If page/domain changed: paste script again, state auto-restores."
   );
 })();
+

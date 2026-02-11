@@ -118,8 +118,11 @@ python -m booking_bot
 3. Paste content of `scripts/capture_selectors_browser.js`.
 4. Start guided mode: `__bookingCapture.lemana()`.
 5. For each prompted step do `Ctrl+Shift+Click` on target element.
+   Then confirm capture: `__bookingCapture.ok()`.
+   If wrong element was captured: `__bookingCapture.retry()`.
+   If you need one step back: `__bookingCapture.back()`.
    If a step does not exist in your UI, run `__bookingCapture.skip()`.
-   OTP code step does not require selector capture.
+   OTP code step is included (capture input selector), but OTP value itself is not automated.
    After redirect to another domain (for example SSO), paste script again in console:
    saved state restores automatically and flow continues from last step.
 6. Execute `__bookingCapture.env()` and paste output into `.env`.
@@ -171,7 +174,8 @@ scripts/capture_selectors_browser.js
 Open file content, paste it into browser console on the booking page, then run:
 - `__bookingCapture.lemana()` for guided SSO/map flow
 
-For each step, do `Ctrl+Shift+Click` on target element. If a step is not needed, run `__bookingCapture.skip()`.
+For each step, do `Ctrl+Shift+Click` and then `__bookingCapture.ok()`.
+If a step is not needed, run `__bookingCapture.skip()`.
 Then run:
 - `__bookingCapture.dump()` (JSON),
 - `__bookingCapture.env()` (ready `.env` lines),
