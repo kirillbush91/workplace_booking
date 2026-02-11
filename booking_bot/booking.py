@@ -308,7 +308,13 @@ class BookingBot:
 
         LOGGER.info("Configuring booking parameters.")
         if self.settings.booking_params_open_selector:
-            await self._click_selector(page, self.settings.booking_params_open_selector)
+            try:
+                await self._click_selector(page, self.settings.booking_params_open_selector)
+            except RuntimeError as exc:
+                LOGGER.warning(
+                    "Booking params opener did not respond, trying direct controls: %s",
+                    exc,
+                )
 
         target_date = self._resolve_booking_date()
         if self.settings.booking_date_input_selector and target_date:
@@ -536,6 +542,31 @@ class BookingBot:
                     "Office map did not become ready in time. "
                     "Tune OFFICE_MAP_READY_SELECTOR/OFFICE_MAP_WAIT_TIMEOUT_MS."
                 ) from exc
+
+        # Map data is frequently loaded by XHR after URL change, so wait for
+        # network quiet as a best-effort sync point.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeoutError:
+            LOGGER.debug("Network idle was not reached quickly; continuing.")
+
+        if self.settings.office_map_loading_selectors:
+            observed_loader = False
+            for selector in self.settings.office_map_loading_selectors:
+                loader = page.locator(selector).first
+                try:
+                    await loader.wait_for(state="visible", timeout=3_000)
+                    observed_loader = True
+                    LOGGER.info("Map loader visible: %s", selector)
+                    await loader.wait_for(
+                        state="hidden",
+                        timeout=self.settings.office_map_loading_wait_timeout_ms,
+                    )
+                    LOGGER.info("Map loader hidden: %s", selector)
+                except PlaywrightTimeoutError:
+                    continue
+            if observed_loader:
+                await self._pause(page)
 
         if self.settings.office_map_extra_wait_ms > 0:
             await page.wait_for_timeout(self.settings.office_map_extra_wait_ms)
