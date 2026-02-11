@@ -187,6 +187,20 @@ To discover selectors quickly:
 playwright codegen https://lemana.simple-office-web.liis.su/
 ```
 
+If you want semantic notes after each click (recommended for tricky date picker):
+
+```bash
+python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
+```
+
+The script records every click and asks you in terminal:
+- label (for example `BOOKING_PARAMS_OPEN_SELECTOR`)
+- note (what this click means)
+
+Outputs:
+- `artifacts/selector_annotations.json`
+- `artifacts/selector_annotations.env`
+
 If you cannot run Playwright locally, use browser DevTools helper:
 
 ```bash
