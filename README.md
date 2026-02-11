@@ -204,6 +204,7 @@ Simple mode:
 Finish:
 - press `Finish` in overlay panel (or close browser).
 - `Ctrl+Enter` in note field = quick save.
+- if overlay is hidden after redirect, run in page console: `window.__annSelectorShowPanel()`.
 
 Outputs:
 - `artifacts/selector_annotations.json`

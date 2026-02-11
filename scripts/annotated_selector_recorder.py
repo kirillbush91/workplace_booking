@@ -256,13 +256,15 @@ INJECT_SCRIPT = r"""
         display: none;
       }
     `;
-    document.documentElement.appendChild(style);
+    const styleRoot = document.head || document.documentElement;
+    styleRoot.appendChild(style);
   }
 
   function ensurePanel() {
     let panel = document.getElementById(PANEL_ID);
     if (panel) return panel;
-    if (!document.documentElement) return null;
+    const panelRoot = document.body || document.documentElement;
+    if (!panelRoot) return null;
 
     function el(tag, props) {
       const node = document.createElement(tag);
@@ -330,7 +332,7 @@ INJECT_SCRIPT = r"""
     panel.appendChild(pending);
     panel.appendChild(actions);
 
-    document.documentElement.appendChild(panel);
+    panelRoot.appendChild(panel);
 
     saveButton.addEventListener("click", () => {
       if (!state.pending) return;
@@ -375,6 +377,7 @@ INJECT_SCRIPT = r"""
   }
 
   let lastFocusedPendingId = "";
+  let panelWatchdog = null;
 
   function renderPanel() {
     let panel = document.getElementById(PANEL_ID);
@@ -382,7 +385,7 @@ INJECT_SCRIPT = r"""
       ensureStyle();
       panel = ensurePanel();
     }
-    if (!panel) return;
+    if (!panel) return false;
     const statusEl = panel.querySelector("#__ann_status");
     const idleBlock = panel.querySelector("#__ann_idle_block");
     const pendingBlock = panel.querySelector("#__ann_pending_block");
@@ -404,7 +407,7 @@ INJECT_SCRIPT = r"""
       !saveButton ||
       !skipButton
     ) {
-      return;
+      return false;
     }
 
     statusEl.textContent = state.stop
@@ -425,7 +428,7 @@ INJECT_SCRIPT = r"""
       skipButton.disabled = !hasPending;
     }
 
-    if (!hasPending) return;
+    if (!hasPending) return true;
 
     const pending = state.pending;
     urlEl.textContent = String(pending.url || "");
@@ -439,9 +442,25 @@ INJECT_SCRIPT = r"""
         noteInput.select();
       }, 0);
     }
+    return true;
+  }
+
+  function ensurePanelEventually() {
+    renderPanel();
+    if (panelWatchdog) return;
+    let ticks = 0;
+    panelWatchdog = window.setInterval(() => {
+      ticks += 1;
+      const ok = renderPanel();
+      if ((ok && ticks > 16) || ticks > 240) {
+        window.clearInterval(panelWatchdog);
+        panelWatchdog = null;
+      }
+    }, 250);
   }
 
   document.addEventListener("click", (event) => {
+    ensurePanelEventually();
     if (state.stop) return;
     const panel = document.getElementById(PANEL_ID);
     if (panel && panel.contains(event.target)) return;
@@ -473,8 +492,15 @@ INJECT_SCRIPT = r"""
   }, true);
 
   syncGlobals();
+  window.__annSelectorShowPanel = ensurePanelEventually;
   persistState();
-  renderPanel();
+  ensurePanelEventually();
+  document.addEventListener("DOMContentLoaded", ensurePanelEventually, { once: true });
+  window.addEventListener("load", ensurePanelEventually, { once: true });
+  window.addEventListener("pageshow", ensurePanelEventually);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) ensurePanelEventually();
+  });
   console.log("[recorder] overlay ready. Click element, annotate in panel, press Save.");
 })();
 """
