@@ -120,6 +120,8 @@ python -m booking_bot
 5. For each prompted step do `Ctrl+Shift+Click` on target element.
    If a step does not exist in your UI, run `__bookingCapture.skip()`.
    OTP code step does not require selector capture.
+   After redirect to another domain (for example SSO), paste script again in console:
+   saved state restores automatically and flow continues from last step.
 6. Execute `__bookingCapture.env()` and paste output into `.env`.
 7. Stop helper with `__bookingCapture.stop()`.
 

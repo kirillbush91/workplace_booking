@@ -15,6 +15,7 @@ Usage (Chrome/Edge DevTools):
 (() => {
   const IGNORE_CLASS_PREFIXES = ["ant-", "css-", "sc-", "rc-", "react-", "__"];
   const MAX_TEXT_LENGTH = 100;
+  const STATE_PREFIX = "__bookingCaptureState:";
 
   const LEMANA_FLOW = [
     {
@@ -169,7 +170,81 @@ Usage (Chrome/Edge DevTools):
     handler: null,
     flow: null,
     flowIndex: -1,
+    prevWindowName: "",
   };
+
+  function parsePersistedWindowName() {
+    const raw = window.name || "";
+    if (!raw.startsWith(STATE_PREFIX)) return null;
+    const payload = raw.slice(STATE_PREFIX.length);
+    try {
+      return JSON.parse(decodeURIComponent(payload));
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function savePersistedState() {
+    const current = parsePersistedWindowName();
+    const prevWindowName =
+      state.prevWindowName ||
+      (current && typeof current.prevWindowName === "string"
+        ? current.prevWindowName
+        : "");
+
+    const payload = {
+      prevWindowName,
+      records: state.records || {},
+      flowKind: state.flow ? "lemana" : null,
+      flowIndex: state.flow ? state.flowIndex : -1,
+      activeLabel: state.activeLabel || null,
+    };
+    window.name = STATE_PREFIX + encodeURIComponent(JSON.stringify(payload));
+  }
+
+  function clearPersistedState() {
+    const persisted = parsePersistedWindowName();
+    if (persisted && typeof persisted.prevWindowName === "string") {
+      window.name = persisted.prevWindowName;
+    } else {
+      window.name = "";
+    }
+  }
+
+  function restorePersistedState() {
+    const persisted = parsePersistedWindowName();
+    if (!persisted) return false;
+
+    state.prevWindowName =
+      typeof persisted.prevWindowName === "string" ? persisted.prevWindowName : "";
+    state.records = persisted.records && typeof persisted.records === "object"
+      ? persisted.records
+      : {};
+
+    if (persisted.flowKind === "lemana" && Number.isInteger(persisted.flowIndex)) {
+      state.flow = LEMANA_FLOW;
+      state.flowIndex = persisted.flowIndex;
+      if (state.flowIndex < 0) state.flowIndex = 0;
+      if (state.flowIndex >= state.flow.length) state.flowIndex = state.flow.length - 1;
+      const step = currentFlowStep();
+      state.activeLabel = step ? step.label : null;
+      if (step) {
+        console.log(
+          `[capture] Restored flow step ${state.flowIndex + 1}/${state.flow.length}: ${step.label}`
+        );
+        console.log(`[capture] ${step.hint}`);
+      }
+      return true;
+    }
+
+    state.flow = null;
+    state.flowIndex = -1;
+    state.activeLabel = persisted.activeLabel || null;
+    if (state.activeLabel) {
+      console.log(`[capture] Restored active label: ${state.activeLabel}`);
+    }
+    return true;
+  }
 
   function currentFlowStep() {
     if (!state.flow) return null;
@@ -178,11 +253,15 @@ Usage (Chrome/Edge DevTools):
   }
 
   function startFlow(flow) {
+    if (!state.prevWindowName && !parsePersistedWindowName()) {
+      state.prevWindowName = window.name || "";
+    }
     state.flow = flow;
     state.flowIndex = 0;
     const step = currentFlowStep();
     if (!step) return;
     state.activeLabel = step.label;
+    savePersistedState();
     console.log(`[capture] Flow started. Step 1/${flow.length}: ${step.label}`);
     console.log(`[capture] ${step.hint}`);
     console.log("[capture] Do Ctrl+Shift+Click on target element.");
@@ -196,10 +275,12 @@ Usage (Chrome/Edge DevTools):
       state.flow = null;
       state.flowIndex = -1;
       state.activeLabel = null;
+      savePersistedState();
       console.log("[capture] Flow finished. Run __bookingCapture.env()");
       return;
     }
     state.activeLabel = step.label;
+    savePersistedState();
     console.log(
       `[capture] Next step ${state.flowIndex + 1}/${state.flow.length}: ${step.label}`
     );
@@ -221,6 +302,7 @@ Usage (Chrome/Edge DevTools):
       state.flow = null;
       state.flowIndex = -1;
       state.activeLabel = label;
+      savePersistedState();
       console.log(`[capture] Waiting for Ctrl+Shift+Click for "${label}".`);
     },
 
@@ -243,6 +325,7 @@ Usage (Chrome/Edge DevTools):
         placeholder: "",
         skipped: true,
       };
+      savePersistedState();
       console.log(`[capture] Skipped ${step.label}`);
       nextFlowStep();
     },
@@ -257,7 +340,17 @@ Usage (Chrome/Edge DevTools):
         placeholder: "",
         manual: true,
       };
+      savePersistedState();
       console.log(`[capture] Manually set ${label}: ${selector}`);
+    },
+
+    reset() {
+      state.activeLabel = null;
+      state.records = {};
+      state.flow = null;
+      state.flowIndex = -1;
+      clearPersistedState();
+      console.log("[capture] Reset done. Run __bookingCapture.lemana()");
     },
 
     show() {
@@ -316,6 +409,7 @@ Usage (Chrome/Edge DevTools):
       state.activeLabel = null;
       state.flow = null;
       state.flowIndex = -1;
+      clearPersistedState();
       console.log("[capture] Stopped.");
     },
   };
@@ -339,15 +433,24 @@ Usage (Chrome/Edge DevTools):
       className: el.className || "",
       placeholder: el.getAttribute("placeholder") || "",
     };
+    savePersistedState();
 
     console.log(`[capture] Saved ${state.activeLabel}: ${selector}`);
     if (state.flow) nextFlowStep();
-    else state.activeLabel = null;
+    else {
+      state.activeLabel = null;
+      savePersistedState();
+    }
   };
 
   document.addEventListener("click", state.handler, true);
   window.__bookingCapture = api;
   console.log("[capture] Ready.");
   console.log("[capture] Run __bookingCapture.lemana() for guided flow.");
+  if (!restorePersistedState()) {
+    state.prevWindowName = window.name || "";
+  }
+  console.log(
+    "[capture] If page/domain changed: paste script again, state is auto-restored."
+  );
 })();
-
