@@ -198,6 +198,8 @@ Simple mode:
 - write note in overlay panel (bottom-right),
 - press `Save`,
 - repeat.
+- after redirects (including SSO domain change), overlay is re-injected automatically.
+- if click caused instant redirect, pending note is shown on the next page.
 
 Finish:
 - press `Finish` in overlay panel (or close browser).

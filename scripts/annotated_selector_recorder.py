@@ -181,6 +181,7 @@ INJECT_SCRIPT = r"""
 
   function ensureStyle() {
     if (document.getElementById(STYLE_ID)) return;
+    if (!document.documentElement) return;
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
@@ -261,46 +262,75 @@ INJECT_SCRIPT = r"""
   function ensurePanel() {
     let panel = document.getElementById(PANEL_ID);
     if (panel) return panel;
+    if (!document.documentElement) return null;
+
+    function el(tag, props) {
+      const node = document.createElement(tag);
+      const cfg = props || {};
+      if (cfg.id) node.id = cfg.id;
+      if (cfg.className) node.className = cfg.className;
+      if (cfg.text !== undefined && cfg.text !== null) node.textContent = String(cfg.text);
+      return node;
+    }
+
+    function rowWithCode(label, codeId) {
+      const row = el("div", { className: "ann-row" });
+      row.appendChild(document.createTextNode(label));
+      const code = el("code", { id: codeId });
+      row.appendChild(code);
+      return row;
+    }
 
     panel = document.createElement("div");
     panel.id = PANEL_ID;
-    panel.innerHTML = `
-      <div class="ann-title">Selector Recorder</div>
-      <div class="ann-muted" id="__ann_status"></div>
-      <div id="__ann_idle_block" class="ann-row">
-        Click target in page. Then add a note and press Save.
-      </div>
-      <div id="__ann_pending_block" class="ann-hidden">
-        <div class="ann-row">
-          URL
-          <code id="__ann_url"></code>
-        </div>
-        <div class="ann-row">
-          Selector
-          <code id="__ann_selector"></code>
-        </div>
-        <div class="ann-row">
-          Text
-          <code id="__ann_text"></code>
-        </div>
-        <div class="ann-row">
-          Note
-          <textarea id="__ann_note" placeholder="Example: clicked date picker opener"></textarea>
-        </div>
-      </div>
-      <div class="ann-actions">
-        <button type="button" class="ann-primary" id="__ann_save">Save</button>
-        <button type="button" id="__ann_skip">Skip</button>
-        <button type="button" class="ann-danger" id="__ann_finish">Finish</button>
-      </div>
-    `;
+
+    const title = el("div", { className: "ann-title", text: "Selector Recorder" });
+    const status = el("div", { className: "ann-muted", id: "__ann_status" });
+
+    const idle = el("div", {
+      id: "__ann_idle_block",
+      className: "ann-row",
+      text: "Click target in page. Then add a note and press Save.",
+    });
+
+    const pending = el("div", { id: "__ann_pending_block", className: "ann-hidden" });
+    pending.appendChild(rowWithCode("URL", "__ann_url"));
+    pending.appendChild(rowWithCode("Selector", "__ann_selector"));
+    pending.appendChild(rowWithCode("Text", "__ann_text"));
+
+    const noteRow = el("div", { className: "ann-row" });
+    noteRow.appendChild(document.createTextNode("Note"));
+    const noteInput = el("textarea", { id: "__ann_note" });
+    noteInput.setAttribute("placeholder", "Example: clicked date picker opener");
+    noteRow.appendChild(noteInput);
+    pending.appendChild(noteRow);
+
+    const actions = el("div", { className: "ann-actions" });
+    const saveButton = el("button", {
+      id: "__ann_save",
+      className: "ann-primary",
+      text: "Save",
+    });
+    saveButton.setAttribute("type", "button");
+    const skipButton = el("button", { id: "__ann_skip", text: "Skip" });
+    skipButton.setAttribute("type", "button");
+    const finishButton = el("button", {
+      id: "__ann_finish",
+      className: "ann-danger",
+      text: "Finish",
+    });
+    finishButton.setAttribute("type", "button");
+    actions.appendChild(saveButton);
+    actions.appendChild(skipButton);
+    actions.appendChild(finishButton);
+
+    panel.appendChild(title);
+    panel.appendChild(status);
+    panel.appendChild(idle);
+    panel.appendChild(pending);
+    panel.appendChild(actions);
 
     document.documentElement.appendChild(panel);
-
-    const saveButton = panel.querySelector("#__ann_save");
-    const skipButton = panel.querySelector("#__ann_skip");
-    const finishButton = panel.querySelector("#__ann_finish");
-    const noteInput = panel.querySelector("#__ann_note");
 
     saveButton.addEventListener("click", () => {
       if (!state.pending) return;
@@ -347,8 +377,12 @@ INJECT_SCRIPT = r"""
   let lastFocusedPendingId = "";
 
   function renderPanel() {
-    ensureStyle();
-    const panel = ensurePanel();
+    let panel = document.getElementById(PANEL_ID);
+    if (!panel) {
+      ensureStyle();
+      panel = ensurePanel();
+    }
+    if (!panel) return;
     const statusEl = panel.querySelector("#__ann_status");
     const idleBlock = panel.querySelector("#__ann_idle_block");
     const pendingBlock = panel.querySelector("#__ann_pending_block");
@@ -358,6 +392,20 @@ INJECT_SCRIPT = r"""
     const noteInput = panel.querySelector("#__ann_note");
     const saveButton = panel.querySelector("#__ann_save");
     const skipButton = panel.querySelector("#__ann_skip");
+
+    if (
+      !statusEl ||
+      !idleBlock ||
+      !pendingBlock ||
+      !urlEl ||
+      !selectorEl ||
+      !textEl ||
+      !noteInput ||
+      !saveButton ||
+      !skipButton
+    ) {
+      return;
+    }
 
     statusEl.textContent = state.stop
       ? `Finished. Captured: ${state.records.length}.`
