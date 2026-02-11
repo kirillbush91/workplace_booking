@@ -141,6 +141,9 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `OFFICE_CHOOSE_SELECTOR`: click direct office action on `/offices` page.
 - `OFFICE_OPEN_SELECTOR`: click this first if office list is behind dropdown/modal.
 - `OFFICE_OPTION_SELECTOR_TEMPLATE`: selector for office option.
+- `OFFICE_MAP_READY_SELECTOR`: optional selector that confirms map UI is ready after office click.
+- `OFFICE_MAP_WAIT_TIMEOUT_MS`: max wait for map screen after office click.
+- `OFFICE_MAP_EXTRA_WAIT_MS`: additional fixed delay after map is ready (for slow UI rendering).
 - `BOOKING_PARAMS_OPEN_SELECTOR`: open booking parameters panel on map page.
 - `BOOKING_DATE_INPUT_SELECTOR`: date input in booking parameters.
 - `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: optional fallback selector for day cell (supports `{day}`).

@@ -59,6 +59,7 @@ class BookingBot:
                 browser = await playwright.chromium.launch(headless=self.settings.headless)
                 context = await self._new_context(browser)
                 page = await context.new_page()
+                page.on("close", lambda: LOGGER.error("Playwright page was closed unexpectedly."))
                 page.set_default_timeout(self.settings.default_timeout_ms)
 
                 LOGGER.info("Opening booking page: %s", self.settings.booking_url)
@@ -88,7 +89,7 @@ class BookingBot:
                     screenshot_path=screenshot,
                 )
         except Exception as exc:
-            if page is not None:
+            if page is not None and not page.is_closed():
                 try:
                     screenshot = await self._capture_screenshot(page, "error")
                 except Exception:
@@ -103,9 +104,15 @@ class BookingBot:
                     await context.storage_state(path=str(self.settings.storage_state_path))
                 except Exception:
                     LOGGER.exception("Failed to persist browser storage state.")
-                await context.close()
+                try:
+                    await context.close()
+                except Exception:
+                    LOGGER.exception("Failed to close browser context cleanly.")
             if browser is not None:
-                await browser.close()
+                try:
+                    await browser.close()
+                except Exception:
+                    LOGGER.exception("Failed to close browser cleanly.")
 
     async def _new_context(self, browser: Browser) -> BrowserContext:
         if self.settings.storage_state_path.exists():
@@ -267,6 +274,7 @@ class BookingBot:
         LOGGER.info("Selecting office: %s", self.settings.target_office)
         if self.settings.office_choose_selector:
             await self._click_selector(page, self.settings.office_choose_selector)
+            await self._wait_for_office_map_ready(page)
             return
 
         if self.settings.office_open_selector:
@@ -275,9 +283,11 @@ class BookingBot:
         if self.settings.office_option_selector_template:
             selector = self._format_selector(self.settings.office_option_selector_template)
             await self._click_selector(page, selector)
+            await self._wait_for_office_map_ready(page)
             return
 
         await self._click_text(page, self.settings.target_office)
+        await self._wait_for_office_map_ready(page)
 
     async def _configure_booking_parameters(self, page: Page) -> None:
         has_any_param = any(
@@ -414,8 +424,14 @@ class BookingBot:
 
     async def _click_selector(self, page: Page, selector: str) -> None:
         locator = page.locator(selector).first
-        await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
-        await self._click_locator(page, locator)
+        try:
+            await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
+            await self._click_locator(page, locator)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(
+                f"Selector was not visible/clickable in time: '{selector}' "
+                f"(url={page.url})"
+            ) from exc
 
     async def _click_text(
         self,
@@ -441,15 +457,20 @@ class BookingBot:
 
     async def _fill_input_like_user(self, page: Page, selector: str, value: str) -> None:
         locator = page.locator(selector).first
-        await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
-        await locator.click()
         try:
-            await locator.fill(value)
-        except Exception:
-            await page.keyboard.press("Control+A")
-            await page.keyboard.type(value)
-        await page.keyboard.press("Enter")
-        await self._pause(page)
+            await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
+            await locator.click()
+            try:
+                await locator.fill(value)
+            except Exception:
+                await page.keyboard.press("Control+A")
+                await page.keyboard.type(value)
+            await page.keyboard.press("Enter")
+            await self._pause(page)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(
+                f"Input selector was not visible in time: '{selector}' (url={page.url})"
+            ) from exc
 
     async def _click_locator(self, page: Page, locator: Locator) -> None:
         await locator.scroll_into_view_if_needed()
@@ -479,6 +500,46 @@ class BookingBot:
             timeout=self.settings.default_timeout_ms,
         )
         await self._pause(page)
+
+    async def _wait_for_office_map_ready(self, page: Page) -> None:
+        timeout_ms = self.settings.office_map_wait_timeout_ms
+        LOGGER.info(
+            "Waiting for office map readiness (timeout=%sms).",
+            timeout_ms,
+        )
+        try:
+            await page.wait_for_url("**/map**", timeout=timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            raise RuntimeError(
+                "Map page was not opened after office selection. "
+                "Check OFFICE_CHOOSE_SELECTOR/OFFICE_OPTION_SELECTOR_TEMPLATE."
+            ) from exc
+
+        ready_locator: Locator | None = None
+        if self.settings.office_map_ready_selector:
+            ready_locator = page.locator(self.settings.office_map_ready_selector).first
+        elif self.settings.seat_canvas_selector:
+            canvas = page.locator(self.settings.seat_canvas_selector)
+            ready_locator = (
+                canvas.nth(self.settings.seat_canvas_index)
+                if self.settings.seat_canvas_index is not None
+                else canvas.first
+            )
+        elif self.settings.booking_params_open_selector:
+            ready_locator = page.locator(self.settings.booking_params_open_selector).first
+
+        if ready_locator is not None:
+            try:
+                await ready_locator.wait_for(state="visible", timeout=timeout_ms)
+            except PlaywrightTimeoutError as exc:
+                raise RuntimeError(
+                    "Office map did not become ready in time. "
+                    "Tune OFFICE_MAP_READY_SELECTOR/OFFICE_MAP_WAIT_TIMEOUT_MS."
+                ) from exc
+
+        if self.settings.office_map_extra_wait_ms > 0:
+            await page.wait_for_timeout(self.settings.office_map_extra_wait_ms)
+        LOGGER.info("Office map is ready: %s", page.url)
 
     async def _first_visible_selector(
         self,

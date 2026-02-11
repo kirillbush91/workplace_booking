@@ -109,6 +109,9 @@ class Settings:
     office_choose_selector: str | None
     office_open_selector: str | None
     office_option_selector_template: str | None
+    office_map_ready_selector: str | None
+    office_map_wait_timeout_ms: int
+    office_map_extra_wait_ms: int
 
     booking_params_open_selector: str | None
     booking_params_apply_selector: str | None
@@ -200,6 +203,17 @@ class Settings:
             office_open_selector=_env_optional("OFFICE_OPEN_SELECTOR"),
             office_option_selector_template=_env_optional(
                 "OFFICE_OPTION_SELECTOR_TEMPLATE"
+            ),
+            office_map_ready_selector=_env_optional("OFFICE_MAP_READY_SELECTOR"),
+            office_map_wait_timeout_ms=_env_int(
+                "OFFICE_MAP_WAIT_TIMEOUT_MS",
+                60_000,
+                min_value=1_000,
+            ),
+            office_map_extra_wait_ms=_env_int(
+                "OFFICE_MAP_EXTRA_WAIT_MS",
+                0,
+                min_value=0,
             ),
             booking_params_open_selector=_env_optional("BOOKING_PARAMS_OPEN_SELECTOR"),
             booking_params_apply_selector=_env_optional("BOOKING_PARAMS_APPLY_SELECTOR"),
