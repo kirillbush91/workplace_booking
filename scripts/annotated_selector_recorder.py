@@ -341,16 +341,6 @@ INJECT_SCRIPT = r"""
       }
     });
 
-    panel.addEventListener("click", (event) => {
-      event.stopPropagation();
-    }, true);
-    panel.addEventListener("mousedown", (event) => {
-      event.stopPropagation();
-    }, true);
-    panel.addEventListener("mouseup", (event) => {
-      event.stopPropagation();
-    }, true);
-
     return panel;
   }
 
