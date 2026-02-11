@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
@@ -16,6 +17,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
+from .telegram_client import TelegramNotifier
 
 
 LOGGER = logging.getLogger(__name__)
@@ -37,8 +39,13 @@ class BookingResult:
 
 
 class BookingBot:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        notifier: TelegramNotifier | None = None,
+    ) -> None:
         self.settings = settings
+        self.notifier = notifier
 
     async def book(self) -> BookingResult:
         started_at = datetime.now(timezone.utc)
@@ -127,6 +134,11 @@ class BookingBot:
 
         if username_entry is None and password_entry is None:
             LOGGER.info("Login form not detected. Continuing with current session.")
+            if self.notifier and self.notifier.enabled:
+                await asyncio.to_thread(
+                    self.notifier.send,
+                    "[workplace-booking] Login form not detected. Reusing saved session.",
+                )
             return
 
         username_input = username_entry[1] if username_entry else None
@@ -139,6 +151,11 @@ class BookingBot:
             and password_input is not None
         ):
             LOGGER.info("Login form detected. Filling credentials.")
+            if self.notifier and self.notifier.enabled:
+                await asyncio.to_thread(
+                    self.notifier.send,
+                    "[workplace-booking] Login form detected. Filling LDAP/password automatically.",
+                )
             await username_input.fill(self.settings.username)
             await password_input.fill(self.settings.password)
         else:
@@ -162,11 +179,62 @@ class BookingBot:
 
         await page.wait_for_load_state("domcontentloaded")
         await self._pause(page)
+        await self._handle_otp_if_needed(page)
 
         if self.settings.login_success_selector:
             await page.locator(self.settings.login_success_selector).first.wait_for(
                 state="visible", timeout=self.settings.default_timeout_ms
             )
+
+    async def _handle_otp_if_needed(self, page: Page) -> None:
+        selector = self.settings.otp_code_input_selector
+        if not selector:
+            return
+
+        otp_input = page.locator(selector).first
+        try:
+            await otp_input.wait_for(state="visible", timeout=5_000)
+        except PlaywrightTimeoutError:
+            return
+
+        LOGGER.info("OTP input detected.")
+        if self.settings.otp_code_value:
+            # Some OTP pages render one input, some render N inputs.
+            # Focusing the first input and typing raw code works for both patterns.
+            raw_code = self.settings.otp_code_value.replace(" ", "")
+            await otp_input.click()
+            await page.keyboard.press("Control+A")
+            await page.keyboard.type(raw_code)
+        elif self.notifier and self.notifier.enabled:
+            code = await asyncio.to_thread(
+                self.notifier.wait_for_otp_code,
+                max(1, self.settings.otp_wait_timeout_ms // 1000),
+            )
+            if not code:
+                raise RuntimeError("OTP code was not received from Telegram.")
+            await otp_input.click()
+            await page.keyboard.press("Control+A")
+            await page.keyboard.type(code)
+        else:
+            LOGGER.info(
+                "Waiting for manual OTP entry up to %s ms.",
+                self.settings.otp_wait_timeout_ms,
+            )
+
+        try:
+            await otp_input.wait_for(
+                state="hidden",
+                timeout=self.settings.otp_wait_timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            if "/offices" not in page.url:
+                raise RuntimeError(
+                    "OTP step did not complete in time. "
+                    "Set OTP_CODE_VALUE or increase OTP_WAIT_TIMEOUT_MS."
+                ) from None
+
+        await page.wait_for_load_state("domcontentloaded")
+        await self._pause(page)
 
     async def _perform_pre_login_actions(self, page: Page) -> None:
         if not self.settings.pre_login_click_selectors and not self.settings.pre_login_click_texts:
@@ -234,11 +302,29 @@ class BookingBot:
 
         target_date = self._resolve_booking_date()
         if self.settings.booking_date_input_selector and target_date:
-            await self._fill_input_like_user(
-                page=page,
-                selector=self.settings.booking_date_input_selector,
-                value=target_date,
-            )
+            try:
+                await self._fill_input_like_user(
+                    page=page,
+                    selector=self.settings.booking_date_input_selector,
+                    value=target_date,
+                )
+            except Exception:
+                target_day = self._target_day_of_month(target_date)
+                if target_day is None:
+                    raise
+                LOGGER.info(
+                    "Date input fill failed, trying calendar day click: %s",
+                    target_day,
+                )
+                if self.settings.booking_date_day_selector_template:
+                    await self._click_selector(
+                        page,
+                        self.settings.booking_date_day_selector_template.format(
+                            day=target_day
+                        ),
+                    )
+                else:
+                    await self._click_text_exact(page, str(target_day))
 
         if self.settings.booking_type_selector and (
             self.settings.booking_type_option_selector or self.settings.booking_type_value
@@ -281,6 +367,14 @@ class BookingBot:
         if self.settings.seat_selector_template:
             selector = self._format_selector(self.settings.seat_selector_template)
             await self._click_selector(page, selector)
+            return
+
+        if (
+            self.settings.seat_canvas_selector
+            and self.settings.seat_canvas_x is not None
+            and self.settings.seat_canvas_y is not None
+        ):
+            await self._click_seat_canvas(page)
             return
 
         await self._click_text(page, self.settings.target_seat)
@@ -334,6 +428,17 @@ class BookingBot:
         await locator.wait_for(state="visible", timeout=wait_timeout)
         await self._click_locator(page, locator)
 
+    async def _click_text_exact(
+        self,
+        page: Page,
+        text: str,
+        timeout_ms: int | None = None,
+    ) -> None:
+        wait_timeout = timeout_ms or self.settings.default_timeout_ms
+        locator = page.get_by_text(text, exact=True).first
+        await locator.wait_for(state="visible", timeout=wait_timeout)
+        await self._click_locator(page, locator)
+
     async def _fill_input_like_user(self, page: Page, selector: str, value: str) -> None:
         locator = page.locator(selector).first
         await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
@@ -355,6 +460,24 @@ class BookingBot:
                 bounds["y"] + bounds["height"] / 2,
             )
         await locator.click(timeout=self.settings.default_timeout_ms)
+        await self._pause(page)
+
+    async def _click_seat_canvas(self, page: Page) -> None:
+        locator = page.locator(self.settings.seat_canvas_selector or "canvas")
+        if self.settings.seat_canvas_index is not None:
+            locator = locator.nth(self.settings.seat_canvas_index)
+        else:
+            locator = locator.first
+
+        await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
+        await locator.scroll_into_view_if_needed()
+        await locator.click(
+            position={
+                "x": float(self.settings.seat_canvas_x),
+                "y": float(self.settings.seat_canvas_y),
+            },
+            timeout=self.settings.default_timeout_ms,
+        )
         await self._pause(page)
 
     async def _first_visible_selector(
@@ -396,6 +519,12 @@ class BookingBot:
             date_value = datetime.now() + timedelta(days=self.settings.booking_date_offset_days)
             return date_value.strftime(self.settings.booking_date_format)
         return None
+
+    def _target_day_of_month(self, value: str) -> int | None:
+        try:
+            return datetime.strptime(value, self.settings.booking_date_format).day
+        except ValueError:
+            return None
 
     async def _pause(self, page: Page) -> None:
         if self.settings.ui_pause_ms > 0:

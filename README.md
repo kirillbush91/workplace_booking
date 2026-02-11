@@ -34,8 +34,10 @@ cp .env.example .env
 
 Fill `.env`:
 - `TARGET_OFFICE`, `TARGET_SEAT` are required.
-- set `USERNAME` and `PASSWORD` if login form is expected.
+- set `USERNAME` and `PASSWORD` for LDAP form auto-fill.
 - add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for alerts.
+- set `OTP_CODE_INPUT_SELECTOR` for OTP screen.  
+  If `OTP_CODE_VALUE` is empty, bot will request OTP code in Telegram and wait for your reply.
 
 Run once:
 
@@ -122,7 +124,7 @@ python -m booking_bot
    If wrong element was captured: `__bookingCapture.retry()`.
    If you need one step back: `__bookingCapture.back()`.
    If a step does not exist in your UI, run `__bookingCapture.skip()`.
-   OTP code step is included (capture input selector), but OTP value itself is not automated.
+   OTP code step is included. You can either enter OTP manually (bot waits) or set `OTP_CODE_VALUE`.
    After redirect to another domain (for example SSO), paste script again in console:
    saved state restores automatically and flow continues from last step.
 6. Execute `__bookingCapture.env()` and paste output into `.env`.
@@ -133,16 +135,21 @@ python -m booking_bot
 Different UI builds can expose different HTML selectors, so most selectors are configurable.
 
 - `PRE_LOGIN_CLICK_SELECTORS`: optional click targets before login form handling (for SSO entry button).
+- `OTP_CODE_INPUT_SELECTOR`: OTP input (or first digit input) shown after SSO submit.
+- `OTP_CODE_VALUE`: optional static OTP value. Usually keep it empty and reply with code in Telegram.
+- `OTP_WAIT_TIMEOUT_MS`: how long to wait for OTP completion.
 - `OFFICE_CHOOSE_SELECTOR`: click direct office action on `/offices` page.
 - `OFFICE_OPEN_SELECTOR`: click this first if office list is behind dropdown/modal.
 - `OFFICE_OPTION_SELECTOR_TEMPLATE`: selector for office option.
 - `BOOKING_PARAMS_OPEN_SELECTOR`: open booking parameters panel on map page.
 - `BOOKING_DATE_INPUT_SELECTOR`: date input in booking parameters.
+- `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: optional fallback selector for day cell (supports `{day}`).
 - `BOOKING_TYPE_SELECTOR`: booking type chooser opener.
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.
 - `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs.
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
 - `SEAT_SELECTOR_TEMPLATE`: selector for seat element.
+- `SEAT_CANVAS_SELECTOR` + `SEAT_CANVAS_INDEX` + `SEAT_CANVAS_X/Y`: fallback for canvas-based seat maps.
 - `BOOK_BUTTON_SELECTOR`: selector for final booking button.
 - `SUCCESS_SELECTOR` or `SUCCESS_TEXT`: positive confirmation check.
 
@@ -185,11 +192,11 @@ Then run:
 
 If SSO/MFA/captcha appears, full unattended login may be blocked by your identity provider.
 Recommended setup:
-1. run bot once in headed mode (`HEADLESS=false`) and complete login manually if needed;
-2. bot saves session state to `STORAGE_STATE_PATH`;
-3. next runs re-use saved session automatically.
+1. configure `USERNAME`, `PASSWORD`, `OTP_CODE_INPUT_SELECTOR`, Telegram bot token/chat id;
+2. when OTP page appears, bot sends a Telegram message and waits for your 6-digit reply;
+3. bot saves session state to `STORAGE_STATE_PATH` and re-uses it next runs.
 
-If session expires, run once in headed mode again.
+If session is still valid, OTP/login steps are skipped automatically.
 
 ## 4) Telegram notifications
 
@@ -198,7 +205,10 @@ Create bot in Telegram via `@BotFather`, then set:
 - `TELEGRAM_CHAT_ID=...`
 
 Messages include:
-- status (success/failure),
+- start of each attempt,
+- status (success/failure) for each attempt,
+- retry notification before next attempt,
+- OTP request/timeout status when OTP screen is detected,
 - attempt number,
 - seat/office,
 - UTC timestamp,

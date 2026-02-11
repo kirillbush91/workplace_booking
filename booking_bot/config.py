@@ -102,6 +102,9 @@ class Settings:
     pre_login_click_selectors: list[str]
     pre_login_click_texts: list[str]
     pre_login_click_timeout_ms: int
+    otp_code_input_selector: str | None
+    otp_code_value: str | None
+    otp_wait_timeout_ms: int
 
     office_choose_selector: str | None
     office_open_selector: str | None
@@ -111,6 +114,7 @@ class Settings:
     booking_params_apply_selector: str | None
     booking_params_close_selector: str | None
     booking_date_input_selector: str | None
+    booking_date_day_selector_template: str | None
     booking_date_value: str | None
     booking_date_offset_days: int | None
     booking_date_format: str
@@ -124,6 +128,10 @@ class Settings:
 
     seat_search_selector: str | None
     seat_selector_template: str | None
+    seat_canvas_selector: str | None
+    seat_canvas_index: int | None
+    seat_canvas_x: int | None
+    seat_canvas_y: int | None
     book_button_selector: str | None
     book_button_texts: list[str]
     success_selector: str | None
@@ -181,6 +189,13 @@ class Settings:
                 4_000,
                 min_value=0,
             ),
+            otp_code_input_selector=_env_optional("OTP_CODE_INPUT_SELECTOR"),
+            otp_code_value=_env_optional("OTP_CODE_VALUE"),
+            otp_wait_timeout_ms=_env_int(
+                "OTP_WAIT_TIMEOUT_MS",
+                120_000,
+                min_value=1_000,
+            ),
             office_choose_selector=_env_optional("OFFICE_CHOOSE_SELECTOR"),
             office_open_selector=_env_optional("OFFICE_OPEN_SELECTOR"),
             office_option_selector_template=_env_optional(
@@ -190,6 +205,9 @@ class Settings:
             booking_params_apply_selector=_env_optional("BOOKING_PARAMS_APPLY_SELECTOR"),
             booking_params_close_selector=_env_optional("BOOKING_PARAMS_CLOSE_SELECTOR"),
             booking_date_input_selector=_env_optional("BOOKING_DATE_INPUT_SELECTOR"),
+            booking_date_day_selector_template=_env_optional(
+                "BOOKING_DATE_DAY_SELECTOR_TEMPLATE"
+            ),
             booking_date_value=_env_optional("BOOKING_DATE_VALUE"),
             booking_date_offset_days=_env_optional_int(
                 "BOOKING_DATE_OFFSET_DAYS",
@@ -205,6 +223,10 @@ class Settings:
             booking_time_to=_env_optional("BOOKING_TIME_TO"),
             seat_search_selector=_env_optional("SEAT_SEARCH_SELECTOR"),
             seat_selector_template=_env_optional("SEAT_SELECTOR_TEMPLATE"),
+            seat_canvas_selector=_env_optional("SEAT_CANVAS_SELECTOR"),
+            seat_canvas_index=_env_optional_int("SEAT_CANVAS_INDEX", min_value=0),
+            seat_canvas_x=_env_optional_int("SEAT_CANVAS_X", min_value=0),
+            seat_canvas_y=_env_optional_int("SEAT_CANVAS_Y", min_value=0),
             book_button_selector=_env_optional("BOOK_BUTTON_SELECTOR"),
             book_button_texts=_env_list(
                 "BOOK_BUTTON_TEXTS", default=DEFAULT_BOOK_BUTTON_TEXTS
@@ -235,4 +257,3 @@ class Settings:
             telegram_chat_id=_env_optional("TELEGRAM_CHAT_ID"),
             log_level=(_env_optional("LOG_LEVEL") or "INFO").upper(),
         )
-
