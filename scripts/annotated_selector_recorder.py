@@ -143,11 +143,19 @@ INJECT_SCRIPT = r"""
 
   function normalizeState(state) {
     const out = state && typeof state === "object" ? state : {};
+    const ui = out.ui && typeof out.ui === "object" ? out.ui : {};
+    const uiX = Number(ui.x);
+    const uiY = Number(ui.y);
     return {
       prevWindowName: typeof out.prevWindowName === "string" ? out.prevWindowName : "",
       records: Array.isArray(out.records) ? out.records : [],
       pending: out.pending && typeof out.pending === "object" ? out.pending : null,
       stop: !!out.stop,
+      ui: {
+        x: Number.isFinite(uiX) ? uiX : null,
+        y: Number.isFinite(uiY) ? uiY : null,
+        collapsed: !!ui.collapsed,
+      },
     };
   }
 
@@ -174,6 +182,7 @@ INJECT_SCRIPT = r"""
       records: state.records,
       pending: state.pending,
       stop: state.stop,
+      ui: state.ui,
     };
     window.name = STATE_PREFIX + encodeURIComponent(JSON.stringify(payload));
     syncGlobals();
@@ -198,12 +207,35 @@ INJECT_SCRIPT = r"""
         font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
         padding: 10px;
       }
+      #${PANEL_ID}.ann-dragging {
+        opacity: 0.95;
+      }
+      #${PANEL_ID} .ann-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        cursor: move;
+        user-select: none;
+        margin-bottom: 6px;
+      }
+      #${PANEL_ID} .ann-head-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #${PANEL_ID} .ann-head-hint {
+        color: #94a3b8;
+        font-size: 11px;
+      }
       #${PANEL_ID} .ann-title {
         font-weight: 700;
-        margin-bottom: 6px;
+        margin-bottom: 0;
       }
       #${PANEL_ID} .ann-muted {
         color: #cbd5e1;
+      }
+      #${PANEL_ID}.ann-collapsed #__ann_body {
+        display: none;
       }
       #${PANEL_ID} .ann-row {
         margin-top: 6px;
@@ -286,7 +318,18 @@ INJECT_SCRIPT = r"""
     panel = document.createElement("div");
     panel.id = PANEL_ID;
 
+    const head = el("div", { className: "ann-head", id: "__ann_head" });
     const title = el("div", { className: "ann-title", text: "Selector Recorder" });
+    const headRight = el("div", { className: "ann-head-right" });
+    const headHint = el("div", { className: "ann-head-hint", text: "drag" });
+    const toggleButton = el("button", { id: "__ann_toggle", text: "-" });
+    toggleButton.setAttribute("type", "button");
+    headRight.appendChild(headHint);
+    headRight.appendChild(toggleButton);
+    head.appendChild(title);
+    head.appendChild(headRight);
+
+    const body = el("div", { id: "__ann_body" });
     const status = el("div", { className: "ann-muted", id: "__ann_status" });
 
     const idle = el("div", {
@@ -326,13 +369,66 @@ INJECT_SCRIPT = r"""
     actions.appendChild(skipButton);
     actions.appendChild(finishButton);
 
-    panel.appendChild(title);
-    panel.appendChild(status);
-    panel.appendChild(idle);
-    panel.appendChild(pending);
-    panel.appendChild(actions);
+    body.appendChild(status);
+    body.appendChild(idle);
+    body.appendChild(pending);
+    body.appendChild(actions);
+    panel.appendChild(head);
+    panel.appendChild(body);
 
     panelRoot.appendChild(panel);
+
+    let dragState = null;
+
+    head.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      if (target && target.closest && target.closest("button,input,textarea,select,a")) return;
+      const rect = panel.getBoundingClientRect();
+      dragState = {
+        pointerId: event.pointerId,
+        dx: event.clientX - rect.left,
+        dy: event.clientY - rect.top,
+      };
+      state.ui.x = rect.left;
+      state.ui.y = rect.top;
+      if (panel.setPointerCapture) {
+        try {
+          panel.setPointerCapture(event.pointerId);
+        } catch (_err) {}
+      }
+      panel.classList.add("ann-dragging");
+      applyPanelPosition(panel, false);
+      event.preventDefault();
+    });
+
+    panel.addEventListener("pointermove", (event) => {
+      if (!dragState) return;
+      if (event.pointerId !== dragState.pointerId) return;
+      state.ui.x = event.clientX - dragState.dx;
+      state.ui.y = event.clientY - dragState.dy;
+      applyPanelPosition(panel, false);
+      event.preventDefault();
+    });
+
+    function finishDrag(event) {
+      if (!dragState) return;
+      if (event && event.pointerId !== undefined && event.pointerId !== dragState.pointerId) return;
+      dragState = null;
+      panel.classList.remove("ann-dragging");
+      applyPanelPosition(panel, true);
+    }
+
+    panel.addEventListener("pointerup", finishDrag);
+    panel.addEventListener("pointercancel", finishDrag);
+    panel.addEventListener("lostpointercapture", finishDrag);
+
+    toggleButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      state.ui.collapsed = !state.ui.collapsed;
+      persistState();
+      renderPanel();
+    });
 
     saveButton.addEventListener("click", () => {
       if (!state.pending) return;
@@ -376,6 +472,44 @@ INJECT_SCRIPT = r"""
     return panel;
   }
 
+  function applyPanelPosition(panel, shouldPersist) {
+    if (!panel) return;
+    const x = Number(state.ui.x);
+    const y = Number(state.ui.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      panel.style.left = "";
+      panel.style.top = "";
+      panel.style.right = "12px";
+      panel.style.bottom = "12px";
+      return;
+    }
+
+    const margin = 8;
+    const viewportWidth = Math.max(
+      document.documentElement ? document.documentElement.clientWidth : 0,
+      window.innerWidth || 0
+    );
+    const viewportHeight = Math.max(
+      document.documentElement ? document.documentElement.clientHeight : 0,
+      window.innerHeight || 0
+    );
+    const rect = panel.getBoundingClientRect();
+    const maxX = Math.max(margin, viewportWidth - rect.width - margin);
+    const maxY = Math.max(margin, viewportHeight - rect.height - margin);
+    const nextX = Math.min(maxX, Math.max(margin, x));
+    const nextY = Math.min(maxY, Math.max(margin, y));
+    const changed = nextX !== state.ui.x || nextY !== state.ui.y;
+    state.ui.x = nextX;
+    state.ui.y = nextY;
+
+    panel.style.left = `${Math.round(nextX)}px`;
+    panel.style.top = `${Math.round(nextY)}px`;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+
+    if (shouldPersist && changed) persistState();
+  }
+
   let lastFocusedPendingId = "";
   let panelWatchdog = null;
 
@@ -395,6 +529,7 @@ INJECT_SCRIPT = r"""
     const noteInput = panel.querySelector("#__ann_note");
     const saveButton = panel.querySelector("#__ann_save");
     const skipButton = panel.querySelector("#__ann_skip");
+    const toggleButton = panel.querySelector("#__ann_toggle");
 
     if (
       !statusEl ||
@@ -405,10 +540,21 @@ INJECT_SCRIPT = r"""
       !textEl ||
       !noteInput ||
       !saveButton ||
-      !skipButton
+      !skipButton ||
+      !toggleButton
     ) {
       return false;
     }
+
+    if (state.ui.collapsed) {
+      panel.classList.add("ann-collapsed");
+      toggleButton.textContent = "+";
+    } else {
+      panel.classList.remove("ann-collapsed");
+      toggleButton.textContent = "-";
+    }
+
+    applyPanelPosition(panel, false);
 
     statusEl.textContent = state.stop
       ? `Finished. Captured: ${state.records.length}.`
@@ -428,7 +574,7 @@ INJECT_SCRIPT = r"""
       skipButton.disabled = !hasPending;
     }
 
-    if (!hasPending) return true;
+    if (!hasPending || state.ui.collapsed) return true;
 
     const pending = state.pending;
     urlEl.textContent = String(pending.url || "");
@@ -493,11 +639,22 @@ INJECT_SCRIPT = r"""
 
   syncGlobals();
   window.__annSelectorShowPanel = ensurePanelEventually;
+  window.__annSelectorResetPanel = () => {
+    state.ui.x = null;
+    state.ui.y = null;
+    state.ui.collapsed = false;
+    persistState();
+    ensurePanelEventually();
+  };
   persistState();
   ensurePanelEventually();
   document.addEventListener("DOMContentLoaded", ensurePanelEventually, { once: true });
   window.addEventListener("load", ensurePanelEventually, { once: true });
   window.addEventListener("pageshow", ensurePanelEventually);
+  window.addEventListener("resize", () => {
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) applyPanelPosition(panel, true);
+  });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) ensurePanelEventually();
   });

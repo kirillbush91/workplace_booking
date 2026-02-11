@@ -200,11 +200,14 @@ Simple mode:
 - repeat.
 - after redirects (including SSO domain change), overlay is re-injected automatically.
 - if click caused instant redirect, pending note is shown on the next page.
+- drag panel by header (`Selector Recorder`) to move it away from UI controls.
+- click `-` / `+` in panel header to collapse/expand.
 
 Finish:
 - press `Finish` in overlay panel (or close browser).
 - `Ctrl+Enter` in note field = quick save.
 - if overlay is hidden after redirect, run in page console: `window.__annSelectorShowPanel()`.
+- to reset panel position/size state: `window.__annSelectorResetPanel()`.
 
 Outputs:
 - `artifacts/selector_annotations.json`
