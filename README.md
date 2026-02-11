@@ -198,6 +198,7 @@ Simple mode:
 - write note in overlay panel (bottom-right),
 - press `Save`,
 - repeat.
+- `Captured` increases only after `Save`; `Pending` means click is collected but not saved yet.
 - after redirects (including SSO domain change), overlay is re-injected automatically.
 - if click caused instant redirect, pending note is shown on the next page.
 - drag panel by header (`Selector Recorder`) to move it away from UI controls.

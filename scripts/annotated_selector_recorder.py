@@ -335,7 +335,7 @@ INJECT_SCRIPT = r"""
     const idle = el("div", {
       id: "__ann_idle_block",
       className: "ann-row",
-      text: "Click target in page. Then add a note and press Save.",
+      text: "Click target in page. Then add note and press Save (Captured increases after Save).",
     });
 
     const pending = el("div", { id: "__ann_pending_block", className: "ann-hidden" });
@@ -556,11 +556,17 @@ INJECT_SCRIPT = r"""
 
     applyPanelPosition(panel, false);
 
+    const hasPending = !!state.pending;
+    if (hasPending && state.ui.collapsed) {
+      state.ui.collapsed = false;
+      persistState();
+    }
+
+    const pendingLabel = hasPending ? "1 (not saved)" : "0";
     statusEl.textContent = state.stop
       ? `Finished. Captured: ${state.records.length}.`
-      : `Captured: ${state.records.length}.`;
+      : `Captured: ${state.records.length} | Pending: ${pendingLabel}`;
 
-    const hasPending = !!state.pending;
     idleBlock.classList.toggle("ann-hidden", hasPending);
     pendingBlock.classList.toggle("ann-hidden", !hasPending);
 
@@ -610,12 +616,12 @@ INJECT_SCRIPT = r"""
     if (state.stop) return;
     const panel = document.getElementById(PANEL_ID);
     if (panel && panel.contains(event.target)) return;
-    if (state.pending) return;
 
     const el = event.target;
     if (!el || !el.tagName) return;
 
     const rect = el.getBoundingClientRect();
+    const hadPending = !!state.pending;
     state.pending = {
       recId: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
       ts: new Date().toISOString(),
@@ -632,9 +638,13 @@ INJECT_SCRIPT = r"""
       offsetY: Number((event.clientY || 0) - rect.top),
       note: "",
     };
+    state.ui.collapsed = false;
 
     persistState();
     renderPanel();
+    if (hadPending) {
+      console.log("[recorder] replaced previous pending click (not saved)");
+    }
   }, true);
 
   syncGlobals();
