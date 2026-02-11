@@ -122,6 +122,10 @@ class Settings:
     booking_date_day_selector_template: str | None
     booking_date_value: str | None
     booking_date_offset_days: int | None
+    booking_range_days: int
+    booking_include_today: bool
+    booking_skip_weekends: bool
+    booking_per_date_attempts: int
     booking_date_format: str
     booking_type_selector: str | None
     booking_type_option_selector: str | None
@@ -140,6 +144,7 @@ class Settings:
     book_button_selector: str | None
     book_button_texts: list[str]
     success_selector: str | None
+    success_close_selector: str | None
     success_text: str | None
 
     login_username_selectors: list[str]
@@ -238,6 +243,18 @@ class Settings:
                 "BOOKING_DATE_OFFSET_DAYS",
                 min_value=0,
             ),
+            booking_range_days=_env_int(
+                "BOOKING_RANGE_DAYS",
+                7,
+                min_value=0,
+            ),
+            booking_include_today=_env_bool("BOOKING_INCLUDE_TODAY", True),
+            booking_skip_weekends=_env_bool("BOOKING_SKIP_WEEKENDS", False),
+            booking_per_date_attempts=_env_int(
+                "BOOKING_PER_DATE_ATTEMPTS",
+                2,
+                min_value=1,
+            ),
             booking_date_format=_env_optional("BOOKING_DATE_FORMAT") or "%d.%m.%Y",
             booking_type_selector=_env_optional("BOOKING_TYPE_SELECTOR"),
             booking_type_option_selector=_env_optional("BOOKING_TYPE_OPTION_SELECTOR"),
@@ -257,6 +274,7 @@ class Settings:
                 "BOOK_BUTTON_TEXTS", default=DEFAULT_BOOK_BUTTON_TEXTS
             ),
             success_selector=_env_optional("SUCCESS_SELECTOR"),
+            success_close_selector=_env_optional("SUCCESS_CLOSE_SELECTOR"),
             success_text=_env_optional("SUCCESS_TEXT"),
             login_username_selectors=_env_list(
                 "LOGIN_USERNAME_SELECTORS", default=DEFAULT_LOGIN_USERNAME_SELECTORS

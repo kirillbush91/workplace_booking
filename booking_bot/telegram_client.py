@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
+from pathlib import Path
 import re
 import time
 from urllib import parse, request
@@ -80,6 +82,47 @@ class TelegramNotifier:
             "Current run will fail."
         )
         return None
+
+    def send_document(self, path: Path, caption: str | None = None) -> bool:
+        if not self.enabled:
+            LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")
+            return False
+        if not path.exists():
+            LOGGER.warning("Telegram document path does not exist: %s", path)
+            return False
+
+        assert self.bot_token is not None
+        assert self.chat_id is not None
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendDocument"
+
+        boundary = f"----WorkplaceBooking{int(time.time() * 1000)}"
+        data = self._encode_multipart_formdata(
+            boundary=boundary,
+            fields={
+                "chat_id": str(self.chat_id),
+                "caption": caption or "",
+            },
+            file_field_name="document",
+            file_path=path,
+        )
+        req = request.Request(
+            url=url,
+            data=data,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=40) as response:
+                raw = response.read().decode("utf-8")
+                if response.status != 200:
+                    raise RuntimeError(f"Telegram API HTTP {response.status}: {raw}")
+                body = json.loads(raw)
+                if not body.get("ok"):
+                    raise RuntimeError(f"Telegram API error: {raw}")
+                return True
+        except Exception:
+            LOGGER.exception("Failed to send Telegram document: %s", path)
+            return False
 
     def _extract_six_digit_code(self, text: str) -> str | None:
         direct = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
@@ -166,3 +209,35 @@ class TelegramNotifier:
             if not body.get("ok"):
                 raise RuntimeError(f"Telegram API error: {raw}")
             return body.get("result")
+
+    def _encode_multipart_formdata(
+        self,
+        boundary: str,
+        fields: dict[str, str],
+        file_field_name: str,
+        file_path: Path,
+    ) -> bytes:
+        lines: list[bytes] = []
+        for name, value in fields.items():
+            lines.append(f"--{boundary}".encode("utf-8"))
+            lines.append(
+                f'Content-Disposition: form-data; name="{name}"'.encode("utf-8")
+            )
+            lines.append(b"")
+            lines.append(value.encode("utf-8"))
+
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        file_bytes = file_path.read_bytes()
+        lines.append(f"--{boundary}".encode("utf-8"))
+        lines.append(
+            (
+                f'Content-Disposition: form-data; name="{file_field_name}"; '
+                f'filename="{file_path.name}"'
+            ).encode("utf-8")
+        )
+        lines.append(f"Content-Type: {mime_type}".encode("utf-8"))
+        lines.append(b"")
+        lines.append(file_bytes)
+        lines.append(f"--{boundary}--".encode("utf-8"))
+        lines.append(b"")
+        return b"\r\n".join(lines)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import re
@@ -30,6 +30,19 @@ class BookingError(RuntimeError):
         self.screenshot_path = screenshot_path
 
 
+class DaySkipError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DayBookingResult:
+    date: str
+    status: str
+    message: str
+    attempt: int
+    screenshot_path: Path | None
+
+
 @dataclass(frozen=True)
 class BookingResult:
     started_at: datetime
@@ -37,6 +50,10 @@ class BookingResult:
     office: str
     seat: str
     screenshot_path: Path | None
+    booked_dates: list[str]
+    skipped_dates: list[str]
+    failed_dates: list[str]
+    day_results: list[DayBookingResult]
 
 
 class BookingBot:
@@ -75,12 +92,30 @@ class BookingBot:
                 await self._perform_pre_login_actions(page)
                 await self._login_if_needed(page)
                 await self._select_office(page)
-                await self._configure_booking_parameters(page)
-                await self._select_seat(page)
-                await self._submit_booking(page)
-                await self._wait_for_success(page)
+                target_dates = self._resolve_target_dates()
+                if not target_dates:
+                    raise RuntimeError("No target dates to process.")
+                LOGGER.info(
+                    "Target dates: %s",
+                    ", ".join(d.strftime(self.settings.booking_date_format) for d in target_dates),
+                )
 
-                screenshot = await self._capture_screenshot(page, "success")
+                day_results: list[DayBookingResult] = []
+                for target in target_dates:
+                    day_result = await self._book_single_date(page, target)
+                    day_results.append(day_result)
+                    if day_result.screenshot_path is not None:
+                        screenshot = day_result.screenshot_path
+
+                booked_dates = [r.date for r in day_results if r.status == "booked"]
+                skipped_dates = [r.date for r in day_results if r.status == "skipped"]
+                failed_dates = [r.date for r in day_results if r.status == "failed"]
+                if not booked_dates and failed_dates:
+                    raise RuntimeError(
+                        "No bookings created due to errors. "
+                        f"Failed dates: {', '.join(failed_dates)}"
+                    )
+
                 finished_at = datetime.now(timezone.utc)
                 return BookingResult(
                     started_at=started_at,
@@ -88,6 +123,10 @@ class BookingBot:
                     office=self.settings.target_office,
                     seat=self.settings.target_seat,
                     screenshot_path=screenshot,
+                    booked_dates=booked_dates,
+                    skipped_dates=skipped_dates,
+                    failed_dates=failed_dates,
+                    day_results=day_results,
                 )
         except Exception as exc:
             if page is not None and not page.is_closed():
@@ -290,7 +329,115 @@ class BookingBot:
         await self._click_text(page, self.settings.target_office)
         await self._wait_for_office_map_ready(page)
 
-    async def _configure_booking_parameters(self, page: Page) -> None:
+    async def _book_single_date(self, page: Page, target: date) -> DayBookingResult:
+        date_label = target.strftime(self.settings.booking_date_format)
+        max_attempts = self.settings.booking_per_date_attempts
+
+        for attempt in range(1, max_attempts + 1):
+            LOGGER.info("Processing date %s (attempt %s/%s).", date_label, attempt, max_attempts)
+            try:
+                await self._configure_booking_parameters(page, target_date=target)
+                await self._select_seat(page)
+                await self._submit_booking(page)
+                await self._wait_for_success(page)
+                screenshot = await self._capture_screenshot(
+                    page,
+                    f"success_{target.strftime('%Y%m%d')}",
+                )
+                await self._close_success_modal_if_present(page)
+                result = DayBookingResult(
+                    date=date_label,
+                    status="booked",
+                    message="Booking created.",
+                    attempt=attempt,
+                    screenshot_path=screenshot,
+                )
+                await self._notify_day_result(result)
+                return result
+            except DaySkipError as exc:
+                result = DayBookingResult(
+                    date=date_label,
+                    status="skipped",
+                    message=str(exc),
+                    attempt=attempt,
+                    screenshot_path=None,
+                )
+                await self._notify_day_result(result)
+                await self._recover_after_day_attempt(page)
+                return result
+            except Exception as exc:
+                if page.is_closed():
+                    raise
+                LOGGER.warning(
+                    "Date %s attempt %s failed: %s: %s",
+                    date_label,
+                    attempt,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                await self._recover_after_day_attempt(page)
+                if attempt >= max_attempts:
+                    result = DayBookingResult(
+                        date=date_label,
+                        status="failed",
+                        message=f"{exc.__class__.__name__}: {exc}",
+                        attempt=attempt,
+                        screenshot_path=None,
+                    )
+                    await self._notify_day_result(result)
+                    return result
+        # Defensive fallback.
+        return DayBookingResult(
+            date=date_label,
+            status="failed",
+            message="Unexpected date processing state.",
+            attempt=max_attempts,
+            screenshot_path=None,
+        )
+
+    async def _notify_day_result(self, result: DayBookingResult) -> None:
+        if not (self.notifier and self.notifier.enabled):
+            return
+        icon = {"booked": "✅", "skipped": "⚪", "failed": "❌"}.get(result.status, "ℹ️")
+        message = (
+            "[workplace-booking] Day result\n"
+            f"{icon} Date: {result.date}\n"
+            f"Status: {result.status}\n"
+            f"Attempt: {result.attempt}\n"
+            f"Message: {result.message}"
+        )
+        await asyncio.to_thread(self.notifier.send, message)
+
+    async def _recover_after_day_attempt(self, page: Page) -> None:
+        if page.is_closed():
+            return
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._pause(page)
+
+    async def _close_success_modal_if_present(self, page: Page) -> None:
+        if page.is_closed():
+            return
+        if self.settings.success_close_selector:
+            try:
+                await self._click_selector(page, self.settings.success_close_selector)
+                return
+            except Exception:
+                pass
+        for text in ("Закрыть", "Close", "Done", "OK", "ОК"):
+            try:
+                await self._click_text(page, text, timeout_ms=2_000)
+                return
+            except Exception:
+                continue
+
+    async def _configure_booking_parameters(
+        self,
+        page: Page,
+        target_date: date | None = None,
+    ) -> None:
         has_any_param = any(
             [
                 self.settings.booking_params_open_selector,
@@ -320,36 +467,17 @@ class BookingBot:
                 if opened:
                     LOGGER.info("Booking params/date picker opened by fallback text search.")
 
-        target_date = self._resolve_booking_date()
-        if self.settings.booking_date_input_selector and target_date:
-            try:
-                await self._fill_input_like_user(
-                    page=page,
-                    selector=self.settings.booking_date_input_selector,
-                    value=target_date,
+        resolved_target_date = self._resolve_booking_date(target_date)
+        if resolved_target_date:
+            selected = await self._select_booking_date(
+                page=page,
+                target_date=resolved_target_date,
+            )
+            if not selected:
+                raise DaySkipError(
+                    f"Date {resolved_target_date.strftime(self.settings.booking_date_format)} "
+                    "is not available in calendar."
                 )
-            except Exception:
-                target_day = self._target_day_of_month(target_date)
-                if target_day is None:
-                    raise
-                LOGGER.info(
-                    "Date input fill failed, trying calendar day click: %s",
-                    target_day,
-                )
-                if self.settings.booking_date_day_selector_template:
-                    await self._click_selector(
-                        page,
-                        self.settings.booking_date_day_selector_template.format(
-                            day=target_day
-                        ),
-                    )
-                else:
-                    clicked = await self._click_calendar_day_with_fallback(page, target_day)
-                    if not clicked:
-                        raise RuntimeError(
-                            f"Failed to click calendar day '{target_day}'. "
-                            "Set BOOKING_DATE_DAY_SELECTOR_TEMPLATE to explicit selector."
-                        )
 
         if self.settings.booking_type_selector and (
             self.settings.booking_type_option_selector or self.settings.booking_type_value
@@ -417,9 +545,9 @@ class BookingBot:
                 return
             except Exception as exc:
                 last_exception = exc
-        raise RuntimeError(
-            "Booking button not found. Configure BOOK_BUTTON_SELECTOR "
-            "or BOOK_BUTTON_TEXTS."
+        raise DaySkipError(
+            "Booking button not found for selected date/seat. "
+            "Likely no available slot."
         ) from last_exception
 
     async def _wait_for_success(self, page: Page) -> None:
@@ -470,6 +598,108 @@ class BookingBot:
         await locator.wait_for(state="visible", timeout=wait_timeout)
         await self._click_locator(page, locator)
 
+    async def _select_booking_date(self, page: Page, target_date: date) -> bool:
+        if not await self._open_date_picker_for_target(page):
+            return False
+
+        iso = target_date.strftime("%Y-%m-%d")
+        for month_shift in range(0, 4):
+            if await self._click_calendar_iso_cell(page, iso, allow_disabled=False):
+                return True
+            if await self._click_calendar_iso_cell(page, iso, allow_disabled=True):
+                LOGGER.info("Target date exists but disabled in calendar: %s", iso)
+                return False
+            if month_shift >= 3:
+                break
+            moved = await self._calendar_next_month(page)
+            if not moved:
+                break
+
+        return await self._click_calendar_day_with_fallback(page, target_date.day)
+
+    async def _open_date_picker_for_target(self, page: Page) -> bool:
+        if await self._calendar_is_open(page):
+            return True
+        if self.settings.booking_date_input_selector:
+            try:
+                await self._click_selector(page, self.settings.booking_date_input_selector)
+            except Exception:
+                pass
+        if await self._calendar_is_open(page):
+            return True
+        return await self._try_open_date_picker_by_text(page)
+
+    async def _calendar_is_open(self, page: Page) -> bool:
+        selectors = [
+            ".ant-picker-dropdown .ant-picker-content",
+            ".ant-picker-panel",
+            "[class*=\"calendar\"] [role=\"grid\"]",
+            "[class*=\"date\"] [role=\"grid\"]",
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=1_500)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        return False
+
+    async def _click_calendar_iso_cell(
+        self,
+        page: Page,
+        iso_date: str,
+        allow_disabled: bool,
+    ) -> bool:
+        if allow_disabled:
+            selectors = [
+                f'.ant-picker-dropdown td[title="{iso_date}"]',
+                f'.ant-picker-panel td[title="{iso_date}"]',
+            ]
+        else:
+            selectors = [
+                (
+                    f'.ant-picker-dropdown td[title="{iso_date}"]'
+                    ":not(.ant-picker-cell-disabled) .ant-picker-cell-inner"
+                ),
+                (
+                    f'.ant-picker-panel td[title="{iso_date}"]'
+                    ":not(.ant-picker-cell-disabled) .ant-picker-cell-inner"
+                ),
+            ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=2_000)
+                if allow_disabled:
+                    return True
+                await self._click_locator(page, locator)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+        return False
+
+    async def _calendar_next_month(self, page: Page) -> bool:
+        selectors = [
+            ".ant-picker-dropdown .ant-picker-header-next-btn",
+            ".ant-picker-panel .ant-picker-header-next-btn",
+            "[class*=\"calendar\"] [aria-label*=\"next\"]",
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=2_000)
+                await self._click_locator(page, locator)
+                LOGGER.info("Calendar moved to next month.")
+                return True
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
+        return False
+
     async def _try_open_date_picker_by_text(self, page: Page) -> bool:
         # Handles localized labels like "Ср, 11 февраля" and similar variants.
         date_like_patterns = [
@@ -495,9 +725,9 @@ class BookingBot:
     async def _click_calendar_day_with_fallback(self, page: Page, day: int) -> bool:
         day_str = str(day)
         selectors = [
-            ".ant-picker-dropdown .ant-picker-cell:not(.ant-picker-cell-disabled) "
+            ".ant-picker-dropdown .ant-picker-cell:not(.ant-picker-cell-disabled):not(.ant-picker-cell-in-view-false) "
             f".ant-picker-cell-inner:has-text(\"{day_str}\")",
-            ".ant-picker-panel .ant-picker-cell:not(.ant-picker-cell-disabled) "
+            ".ant-picker-panel .ant-picker-cell:not(.ant-picker-cell-disabled):not(.ant-picker-cell-in-view-false) "
             f".ant-picker-cell-inner:has-text(\"{day_str}\")",
             f"[class*=\"calendar\"] [class*=\"day\"]:has-text(\"{day_str}\")",
         ]
@@ -513,11 +743,7 @@ class BookingBot:
             except Exception:
                 continue
 
-        try:
-            await self._click_text_exact(page, day_str, timeout_ms=3_500)
-            return True
-        except Exception:
-            return False
+        return False
 
     async def _fill_input_like_user(self, page: Page, selector: str, value: str) -> None:
         locator = page.locator(selector).first
@@ -662,19 +888,38 @@ class BookingBot:
             seat_name=self.settings.target_seat,
         )
 
-    def _resolve_booking_date(self) -> str | None:
+    def _resolve_target_dates(self) -> list[date]:
         if self.settings.booking_date_value:
-            return self.settings.booking_date_value
+            parsed = datetime.strptime(
+                self.settings.booking_date_value,
+                self.settings.booking_date_format,
+            ).date()
+            return [parsed]
         if self.settings.booking_date_offset_days is not None:
-            date_value = datetime.now() + timedelta(days=self.settings.booking_date_offset_days)
-            return date_value.strftime(self.settings.booking_date_format)
-        return None
+            return [date.today() + timedelta(days=self.settings.booking_date_offset_days)]
 
-    def _target_day_of_month(self, value: str) -> int | None:
-        try:
-            return datetime.strptime(value, self.settings.booking_date_format).day
-        except ValueError:
-            return None
+        today = date.today()
+        start = today if self.settings.booking_include_today else today + timedelta(days=1)
+        end = today + timedelta(days=self.settings.booking_range_days)
+        current = start
+        out: list[date] = []
+        while current <= end:
+            if not (self.settings.booking_skip_weekends and current.weekday() >= 5):
+                out.append(current)
+            current += timedelta(days=1)
+        return out
+
+    def _resolve_booking_date(self, target_date: date | None) -> date | None:
+        if target_date is not None:
+            return target_date
+        if self.settings.booking_date_value:
+            return datetime.strptime(
+                self.settings.booking_date_value,
+                self.settings.booking_date_format,
+            ).date()
+        if self.settings.booking_date_offset_days is not None:
+            return date.today() + timedelta(days=self.settings.booking_date_offset_days)
+        return None
 
     async def _pause(self, page: Page) -> None:
         if self.settings.ui_pause_ms > 0:

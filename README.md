@@ -6,8 +6,10 @@ The bot:
 - opens the site in a real browser (Playwright),
 - logs in if login form is visible,
 - selects office and seat by UI interaction,
+- books date range from today up to `+7` days by default,
 - clicks booking controls in UI,
 - sends Telegram notification on success/failure,
+- sends confirmation screenshot file to Telegram,
 - saves screenshot and browser session state for debugging and re-use.
 
 ## 1) Quick start (local)
@@ -150,6 +152,12 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_DATE_INPUT_SELECTOR`: date input in booking parameters.
 - If `BOOKING_PARAMS_OPEN_SELECTOR` fails, bot now tries a date-like text fallback automatically.
 - `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: optional fallback selector for day cell (supports `{day}`).
+- `BOOKING_RANGE_DAYS`: date range size from today (default `7`, inclusive).
+- `BOOKING_INCLUDE_TODAY`: include current day in range.
+- `BOOKING_SKIP_WEEKENDS`: optional weekend skip in range mode.
+- `BOOKING_PER_DATE_ATTEMPTS`: retries per date before marking it failed.
+- If `BOOKING_DATE_VALUE` or `BOOKING_DATE_OFFSET_DAYS` is set, bot runs in single-date mode.
+- In range mode bot auto-switches calendar month when target date is in next month.
 - `BOOKING_TYPE_SELECTOR`: booking type chooser opener.
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.
 - `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs.
@@ -158,6 +166,7 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `SEAT_CANVAS_SELECTOR` + `SEAT_CANVAS_INDEX` + `SEAT_CANVAS_X/Y`: fallback for canvas-based seat maps.
 - `BOOK_BUTTON_SELECTOR`: selector for final booking button.
 - `SUCCESS_SELECTOR` or `SUCCESS_TEXT`: positive confirmation check.
+- `SUCCESS_CLOSE_SELECTOR`: close success modal between dates.
 
 Templates support placeholders:
 - `{office}` or `{office_name}` -> value from `TARGET_OFFICE`
@@ -213,12 +222,14 @@ Create bot in Telegram via `@BotFather`, then set:
 Messages include:
 - start of each attempt,
 - status (success/failure) for each attempt,
+- per-day status in range mode (booked/skipped/failed),
 - retry notification before next attempt,
 - OTP request/timeout status when OTP screen is detected,
 - attempt number,
 - seat/office,
 - UTC timestamp,
 - screenshot file path.
+- screenshot file attachment in Telegram (`sendDocument`).
 
 ## 5) Autonomous run modes
 
