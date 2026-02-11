@@ -510,7 +510,6 @@ INJECT_SCRIPT = r"""
     if (shouldPersist && changed) persistState();
   }
 
-  let lastFocusedPendingId = "";
   let panelWatchdog = null;
 
   function renderPanel() {
@@ -587,13 +586,6 @@ INJECT_SCRIPT = r"""
     selectorEl.textContent = String(pending.selector || "");
     textEl.textContent = String(pending.text || "");
 
-    if (pending.recId && pending.recId !== lastFocusedPendingId) {
-      lastFocusedPendingId = pending.recId;
-      setTimeout(() => {
-        noteInput.focus();
-        noteInput.select();
-      }, 0);
-    }
     return true;
   }
 
