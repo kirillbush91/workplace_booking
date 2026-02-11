@@ -7,9 +7,9 @@ Usage:
 Flow:
 1) Browser opens.
 2) You click one element in browser.
-3) Terminal immediately asks: "What did you do?"
+3) Browser asks annotation via prompt ("What did you do?").
 4) Repeat.
-5) Finish by closing browser or typing /q in note prompt.
+5) Finish by closing browser or typing /q in annotation prompt.
 
 Outputs:
 - artifacts/selector_annotations.json
@@ -34,6 +34,7 @@ INJECT_SCRIPT = r"""
   if (window.__annSelectorInstalled) return;
   window.__annSelectorInstalled = true;
   window.__annSelectorRecords = [];
+  window.__annSelectorStop = false;
 
   const IGNORE_CLASS_PREFIXES = ["ant-", "css-", "sc-", "rc-", "react-", "__"];
   const MAX_TEXT_LENGTH = 120;
@@ -130,11 +131,20 @@ INJECT_SCRIPT = r"""
     const el = event.target;
     if (!el || !el.tagName) return;
     const rect = el.getBoundingClientRect();
+    const selector = uniqueSelector(el);
+    const text = textSnippet(el);
+    const annotation = window.prompt(
+      "What did you do?\\nType /q to finish recording.",
+      ""
+    );
+    if (annotation !== null && annotation.trim() === "/q") {
+      window.__annSelectorStop = true;
+    }
     const rec = {
       ts: new Date().toISOString(),
       url: location.href,
-      selector: uniqueSelector(el),
-      text: textSnippet(el),
+      selector: selector,
+      text: text,
       tag: (el.tagName || "").toLowerCase(),
       role: el.getAttribute("role") || "",
       placeholder: el.getAttribute("placeholder") || "",
@@ -142,7 +152,8 @@ INJECT_SCRIPT = r"""
       clickX: Number(event.clientX || 0),
       clickY: Number(event.clientY || 0),
       offsetX: Number((event.clientX || 0) - rect.left),
-      offsetY: Number((event.clientY || 0) - rect.top)
+      offsetY: Number((event.clientY || 0) - rect.top),
+      note: annotation == null ? "" : String(annotation)
     };
     window.__annSelectorRecords.push(rec);
   }, true);
@@ -226,6 +237,19 @@ def _print_record(rec: dict, index: int) -> None:
         "Offset:   "
         f"x={int(rec.get('offsetX', 0))}, y={int(rec.get('offsetY', 0))}"
     )
+    print(f"Note:     {rec.get('note', '')}")
+
+
+def _is_stop_requested(context: BrowserContext) -> bool:
+    pages = [p for p in context.pages if not p.is_closed()]
+    for page in pages:
+        try:
+            flag = page.evaluate("() => !!window.__annSelectorStop")
+            if flag:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _capture_with_inline_annotations(context: BrowserContext) -> list[CaptureItem]:
@@ -235,20 +259,15 @@ def _capture_with_inline_annotations(context: BrowserContext) -> list[CaptureIte
     index = 1
 
     print("Recorder started.")
-    print("Click in browser, then write note in terminal.")
-    print("Finish: close browser or type /q in note prompt.")
+    print("Click in browser and annotate directly in browser prompt.")
+    print("Finish: close browser or type /q in browser prompt.")
 
-    stop_requested = False
     while True:
         _pump_records(context, offsets, pending)
 
         while pending:
             rec = pending.pop(0)
             _print_record(rec, index)
-            note = input("What did you do? ").strip()
-            if note == "/q":
-                stop_requested = True
-                break
 
             out.append(
                 CaptureItem(
@@ -265,13 +284,13 @@ def _capture_with_inline_annotations(context: BrowserContext) -> list[CaptureIte
                     click_y=float(rec.get("clickY", 0.0)),
                     click_offset_x=float(rec.get("offsetX", 0.0)),
                     click_offset_y=float(rec.get("offsetY", 0.0)),
-                    note=note,
+                    note=str(rec.get("note", "")),
                     recorded_at_utc=datetime.now(timezone.utc).isoformat(),
                 )
             )
             index += 1
 
-        if stop_requested:
+        if _is_stop_requested(context):
             break
 
         alive_pages = [p for p in context.pages if not p.is_closed()]
