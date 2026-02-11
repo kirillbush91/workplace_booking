@@ -193,16 +193,14 @@ If you want semantic notes after each click (recommended for tricky date picker)
 python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
 ```
 
-The script runs guided mode by default:
-- label names are predefined automatically,
-- you only click in browser and confirm in terminal,
-- optional note can be entered in plain language.
+Simple mode:
+- click in browser,
+- press Enter in terminal,
+- write free-text note ("what you did").
 
 Useful commands in terminal:
-- `Enter` save step,
-- `r` retry step,
-- `s` skip step,
-- `b` go back one step,
+- `Enter` capture next click,
+- `p` show pending clicks,
 - `q` finish.
 
 Outputs:

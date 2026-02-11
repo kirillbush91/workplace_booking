@@ -1,27 +1,19 @@
 """
-Guided Playwright selector recorder with optional notes.
-
-Default mode is guided: labels are predefined, user does not type label names.
-
-Run:
-  python scripts/annotated_selector_recorder.py --url "https://lemana.simple-office-web.liis.su/"
+Simple free-form Playwright click recorder.
 
 Flow:
-  1) Terminal shows a step (label + hint).
-  2) Click target in browser.
-  3) Confirm in terminal with Enter.
-  4) Optional note can be added in plain language.
-
-Commands during guided flow:
-  - Enter: continue / save
-  - r: retry current step
-  - s: skip current step
-  - b: go back one step
-  - q: finish now
+1) Run script, browser opens.
+2) Click element in browser.
+3) In terminal press Enter.
+4) Script shows captured selector and asks:
+   - "What did you do?" (free text)
+   - optional short label (can be empty)
+5) Repeat.
+6) Type q in terminal to finish.
 
 Outputs:
-  - artifacts/selector_annotations.json
-  - artifacts/selector_annotations.env
+- artifacts/selector_annotations.json
+- artifacts/selector_annotations.env (only from uppercase labels)
 """
 
 from __future__ import annotations
@@ -159,31 +151,6 @@ INJECT_SCRIPT = r"""
 
 
 @dataclass
-class GuidedStep:
-    label: str
-    hint: str
-
-
-GUIDED_STEPS = [
-    GuidedStep("LOGIN_SSO_BUTTON_SELECTOR", "Login page: SSO button"),
-    GuidedStep("LOGIN_SUBMIT_SELECTOR", "SSO page: submit/login button"),
-    GuidedStep("OTP_CODE_INPUT_SELECTOR", "OTP page: code input (or first digit input)"),
-    GuidedStep("OFFICE_CHOOSE_SELECTOR", "Offices page: choose/open required office"),
-    GuidedStep("BOOKING_PARAMS_OPEN_SELECTOR", "Map: open booking/date parameters"),
-    GuidedStep("BOOKING_DATE_INPUT_SELECTOR", "Map: date input/button"),
-    GuidedStep("BOOKING_TYPE_SELECTOR", "Map: booking type selector (optional)"),
-    GuidedStep("BOOKING_TYPE_OPTION_SELECTOR", "Map: booking type option (optional)"),
-    GuidedStep("BOOKING_TIME_FROM_SELECTOR", "Map: time start input (optional)"),
-    GuidedStep("BOOKING_TIME_TO_SELECTOR", "Map: time end input (optional)"),
-    GuidedStep("BOOKING_PARAMS_CLOSE_SELECTOR", "Map: close/apply parameters (optional)"),
-    GuidedStep("SEAT_SELECTOR_TEMPLATE", "Map: click target seat (or seat canvas)"),
-    GuidedStep("BOOK_BUTTON_SELECTOR", "Modal: book button"),
-    GuidedStep("SUCCESS_SELECTOR", "Success modal: success text/title"),
-    GuidedStep("SUCCESS_CLOSE_SELECTOR", "Success modal: close button"),
-]
-
-
-@dataclass
 class CaptureItem:
     ts: str
     url: str
@@ -197,8 +164,8 @@ class CaptureItem:
     click_y: float
     click_offset_x: float
     click_offset_y: float
-    label: str
     note: str
+    label: str
     recorded_at_utc: str
 
 
@@ -248,7 +215,7 @@ def _pump_records(
         pending.extend(rows)
 
 
-def _wait_for_next_record(
+def _wait_for_record(
     context: BrowserContext,
     offsets: dict[int, int],
     pending: list[dict],
@@ -260,57 +227,16 @@ def _wait_for_next_record(
         time.sleep(0.2)
 
 
-def _print_record(rec: dict, label: str, hint: str) -> None:
+def _print_record(rec: dict, index: int) -> None:
     print("")
-    print(f"Captured for: {label}")
-    print(f"Hint:         {hint}")
-    print(f"URL:          {rec.get('url', '')}")
-    print(f"Selector:     {rec.get('selector', '')}")
-    print(f"Text:         {rec.get('text', '')}")
-    print(f"Tag:          {rec.get('tag', '')}")
-    ox = rec.get("offsetX", 0)
-    oy = rec.get("offsetY", 0)
-    print(f"Offset:       x={ox}, y={oy}")
-
-
-def _make_item(rec: dict, label: str, note: str) -> CaptureItem:
-    return CaptureItem(
-        ts=str(rec.get("ts", "")),
-        url=str(rec.get("url", "")),
-        selector=str(rec.get("selector", "")),
-        text=str(rec.get("text", "")),
-        tag=str(rec.get("tag", "")),
-        role=str(rec.get("role", "")),
-        placeholder=str(rec.get("placeholder", "")),
-        class_name=str(rec.get("className", "")),
-        click_x=float(rec.get("clickX", 0.0)),
-        click_y=float(rec.get("clickY", 0.0)),
-        click_offset_x=float(rec.get("offsetX", 0.0)),
-        click_offset_y=float(rec.get("offsetY", 0.0)),
-        label=label,
-        note=note,
-        recorded_at_utc=datetime.now(timezone.utc).isoformat(),
-    )
-
-
-def _make_skipped_item(label: str, note: str) -> CaptureItem:
-    now = datetime.now(timezone.utc).isoformat()
-    return CaptureItem(
-        ts="",
-        url="",
-        selector="",
-        text="",
-        tag="",
-        role="",
-        placeholder="",
-        class_name="",
-        click_x=0.0,
-        click_y=0.0,
-        click_offset_x=0.0,
-        click_offset_y=0.0,
-        label=label,
-        note=note or "skipped",
-        recorded_at_utc=now,
+    print(f"[{index}] Click captured")
+    print(f"URL:      {rec.get('url', '')}")
+    print(f"Selector: {rec.get('selector', '')}")
+    print(f"Text:     {rec.get('text', '')}")
+    print(f"Tag:      {rec.get('tag', '')}")
+    print(
+        "Offset:   "
+        f"x={int(rec.get('offsetX', 0))}, y={int(rec.get('offsetY', 0))}"
     )
 
 
@@ -326,12 +252,10 @@ def _build_env_lines(items: list[CaptureItem]) -> list[str]:
             continue
         if item.selector:
             last_by_key[key] = item.selector
+        if key == "SEAT_SELECTOR_TEMPLATE" and (item.tag == "canvas" or "canvas" in item.selector):
+            seat_canvas_item = item
 
-        if key == "SEAT_SELECTOR_TEMPLATE" and item.selector:
-            if item.tag == "canvas" or "canvas" in item.selector:
-                seat_canvas_item = item
-
-    lines: list[str] = [f"{k}={v}" for k, v in last_by_key.items()]
+    lines = [f"{k}={v}" for k, v in last_by_key.items()]
 
     if seat_canvas_item is not None:
         lines.append("SEAT_CANVAS_SELECTOR=canvas")
@@ -344,54 +268,52 @@ def _build_env_lines(items: list[CaptureItem]) -> list[str]:
     return lines
 
 
-def _capture_loop_guided(context: BrowserContext) -> list[CaptureItem]:
+def _capture_loop(context: BrowserContext) -> list[CaptureItem]:
     offsets: dict[int, int] = {}
     pending: list[dict] = []
     out: list[CaptureItem] = []
-    index = 0
+    index = 1
 
-    print("Guided recorder started.")
-    print("You do NOT type label names.")
-    print("For each step: click element in browser, then confirm in terminal.")
+    print("Simple recorder started.")
+    print("Do action in browser -> press Enter in terminal -> write note.")
+    print("Commands:")
+    print("  Enter: capture next click")
+    print("  p: show number of pending clicks")
+    print("  q: finish")
 
-    while index < len(GUIDED_STEPS):
-        step = GUIDED_STEPS[index]
-        print("")
-        print(f"Step {index + 1}/{len(GUIDED_STEPS)}: {step.label}")
-        print(f"Hint: {step.hint}")
-        command = input("Command [Enter=start, s=skip, b=back, q=finish]: ").strip().lower()
-        if command == "q":
+    while True:
+        cmd = input("\nCommand [Enter/p/q]: ").strip().lower()
+        if cmd == "q":
             break
-        if command == "b":
-            if out:
-                out.pop()
-                index = max(0, index - 1)
-            continue
-        if command == "s":
-            out.append(_make_skipped_item(step.label, "skipped by user"))
-            index += 1
+        if cmd == "p":
+            _pump_records(context, offsets, pending)
+            print(f"Pending clicks: {len(pending)}")
             continue
 
-        print("Now click target element in browser...")
-        rec = _wait_for_next_record(context, offsets, pending)
-        _print_record(rec, step.label, step.hint)
-        action = input("Action [Enter=save, r=retry, s=skip, b=back, q=finish]: ").strip().lower()
-        if action == "q":
-            break
-        if action == "b":
-            if out:
-                out.pop()
-                index = max(0, index - 1)
-            continue
-        if action == "s":
-            out.append(_make_skipped_item(step.label, "skipped by user"))
-            index += 1
-            continue
-        if action == "r":
-            continue
+        rec = _wait_for_record(context, offsets, pending)
+        _print_record(rec, index)
+        note = input("What did you do? ").strip()
+        label = input("Optional label (empty if you do not need it): ").strip()
 
-        note = input("Optional note (Enter to skip): ").strip()
-        out.append(_make_item(rec, step.label, note))
+        out.append(
+            CaptureItem(
+                ts=str(rec.get("ts", "")),
+                url=str(rec.get("url", "")),
+                selector=str(rec.get("selector", "")),
+                text=str(rec.get("text", "")),
+                tag=str(rec.get("tag", "")),
+                role=str(rec.get("role", "")),
+                placeholder=str(rec.get("placeholder", "")),
+                class_name=str(rec.get("className", "")),
+                click_x=float(rec.get("clickX", 0.0)),
+                click_y=float(rec.get("clickY", 0.0)),
+                click_offset_x=float(rec.get("offsetX", 0.0)),
+                click_offset_y=float(rec.get("offsetY", 0.0)),
+                note=note,
+                label=label,
+                recorded_at_utc=datetime.now(timezone.utc).isoformat(),
+            )
+        )
         print("Saved.")
         index += 1
 
@@ -413,7 +335,7 @@ def main() -> int:
     parser.add_argument(
         "--env-output",
         default="artifacts/selector_annotations.env",
-        help="ENV output path.",
+        help="ENV output path (only uppercase labels).",
     )
     args = parser.parse_args()
 
@@ -432,23 +354,21 @@ def main() -> int:
         _ensure_injected(page)
 
         try:
-            items = _capture_loop_guided(context)
+            items = _capture_loop(context)
         except KeyboardInterrupt:
-            print("")
-            print("Interrupted. Saving collected data.")
+            print("\nInterrupted. Saving collected data.")
         finally:
             browser.close()
 
-    rows = [asdict(item) for item in items]
-    output_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_path.write_text(
+        json.dumps([asdict(item) for item in items], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    env_output_path.write_text("\n".join(_build_env_lines(items)), encoding="utf-8")
 
-    env_lines = _build_env_lines(items)
-    env_output_path.write_text("\n".join(env_lines), encoding="utf-8")
-
-    print("")
-    print(f"Saved annotations: {output_path}")
+    print(f"\nSaved annotations: {output_path}")
     print(f"Saved env lines:   {env_output_path}")
-    print("Send me these files or ask me to read them from workspace.")
+    print("Send me file content and I will map selectors to project config.")
     return 0
 
 
