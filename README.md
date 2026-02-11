@@ -194,13 +194,12 @@ python scripts/annotated_selector_recorder.py --url "https://lemana.simple-offic
 ```
 
 Simple mode:
-- click in browser while recorder is running,
-- when finished close browser window,
-- then optionally add free-text notes in terminal.
+- click in browser,
+- terminal immediately asks for free-text note,
+- repeat for next click.
 
 Useful commands in terminal:
-- No commands needed while browser is open.
-- Finish by closing browser windows.
+- To finish, type `/q` as note (or close browser).
 
 Outputs:
 - `artifacts/selector_annotations.json`
