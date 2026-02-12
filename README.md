@@ -153,6 +153,8 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - If `BOOKING_PARAMS_OPEN_SELECTOR` fails, bot now tries a date-like text fallback automatically.
 - `BOOKING_DATE_DAY_SELECTOR_TEMPLATE`: selector template for day cell (supports `{day}`), used before generic fallbacks.
 - `BOOKING_CALENDAR_NEXT_SELECTOR`: optional selector for "next month" control in non-standard calendars.
+- `BOOKING_DATE_VALUES`: optional exact dates list (`|` separated, example `17.02.2026|18.02.2026`).
+  If set, it overrides offset/range mode.
 - `BOOKING_RANGE_DAYS`: date range size from today (default `7`, inclusive).
 - `BOOKING_INCLUDE_TODAY`: include current day in range.
 - `BOOKING_SKIP_WEEKENDS`: optional weekend skip in range mode.

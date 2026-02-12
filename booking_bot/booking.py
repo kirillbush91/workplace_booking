@@ -23,6 +23,14 @@ from .telegram_client import TelegramNotifier
 
 LOGGER = logging.getLogger(__name__)
 
+OTP_HINT_SNIPPETS = [
+    "one-time code",
+    "verification code",
+    "otp",
+    "\u043e\u0434\u043d\u043e\u0440\u0430\u0437\u043e\u0432",
+    "\u044f\u043d\u0434\u0435\u043a\u0441 id",
+]
+
 
 class BookingError(RuntimeError):
     def __init__(self, message: str, screenshot_path: Path | None = None) -> None:
@@ -244,6 +252,28 @@ class BookingBot:
         except PlaywrightTimeoutError:
             return
 
+        otp_screen_hints_found = await self._otp_screen_hints_present(page)
+        if not otp_screen_hints_found:
+            LOGGER.info(
+                "OTP selector matched but OTP screen hints were not found. "
+                "Skipping OTP handling on this screen."
+            )
+            return
+
+        # Some pages reuse the same input component for LDAP login and OTP.
+        # Treat OTP as valid only after password input disappeared.
+        password_still_visible = await self._first_visible_selector(
+            page=page,
+            selectors=self.settings.login_password_selectors,
+            total_timeout_ms=1_200,
+        )
+        if password_still_visible is not None:
+            LOGGER.info(
+                "OTP selector matched while password input is still visible. "
+                "Skipping OTP handling on this screen."
+            )
+            return
+
         LOGGER.info("OTP input detected.")
         if self.settings.otp_code_value:
             # Some OTP pages render one input, some render N inputs.
@@ -282,6 +312,15 @@ class BookingBot:
 
         await page.wait_for_load_state("domcontentloaded")
         await self._pause(page)
+
+    async def _otp_screen_hints_present(self, page: Page) -> bool:
+        try:
+            body_text = await page.locator("body").inner_text(timeout=2_500)
+        except Exception:
+            return False
+
+        normalized = " ".join(body_text.split()).lower()
+        return any(hint in normalized for hint in OTP_HINT_SNIPPETS)
 
     async def _perform_pre_login_actions(self, page: Page) -> None:
         if not self.settings.pre_login_click_selectors and not self.settings.pre_login_click_texts:
@@ -906,6 +945,20 @@ class BookingBot:
         )
 
     def _resolve_target_dates(self) -> list[date]:
+        if self.settings.booking_date_values:
+            out: list[date] = []
+            seen: set[date] = set()
+            for raw in self.settings.booking_date_values:
+                parsed = datetime.strptime(
+                    raw,
+                    self.settings.booking_date_format,
+                ).date()
+                if parsed in seen:
+                    continue
+                seen.add(parsed)
+                out.append(parsed)
+            return out
+
         if self.settings.booking_date_value:
             parsed = datetime.strptime(
                 self.settings.booking_date_value,
@@ -929,6 +982,12 @@ class BookingBot:
     def _resolve_booking_date(self, target_date: date | None) -> date | None:
         if target_date is not None:
             return target_date
+        if self.settings.booking_date_values:
+            first = self.settings.booking_date_values[0]
+            return datetime.strptime(
+                first,
+                self.settings.booking_date_format,
+            ).date()
         if self.settings.booking_date_value:
             return datetime.strptime(
                 self.settings.booking_date_value,
