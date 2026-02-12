@@ -159,8 +159,11 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_INCLUDE_TODAY`: include current day in range.
 - `BOOKING_SKIP_WEEKENDS`: optional weekend skip in range mode.
 - `BOOKING_PER_DATE_ATTEMPTS`: retries per date before marking it failed.
+- `BOOKING_DATE_APPLY_WAIT_TIMEOUT_MS`: max wait for date state sync after calendar click.
+- `BOOKING_USE_URL_DATE_FALLBACK`: if calendar click does not apply date, reloads `/map` with `date_from/date_to` params.
 - If `BOOKING_DATE_VALUE` or `BOOKING_DATE_OFFSET_DAYS` is set, bot runs in single-date mode.
 - In range mode bot auto-switches calendar month when target date is in next month.
+- Date selection is state-aware: bot validates target date by map marker requests (`table_markers`/`room_markers`), URL params, and visible date label before continuing.
 - `BOOKING_TYPE_SELECTOR`: booking type chooser opener.
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.
 - `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs.

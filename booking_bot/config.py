@@ -128,6 +128,8 @@ class Settings:
     booking_include_today: bool
     booking_skip_weekends: bool
     booking_per_date_attempts: int
+    booking_date_apply_wait_timeout_ms: int
+    booking_use_url_date_fallback: bool
     booking_date_format: str
     booking_type_selector: str | None
     booking_type_option_selector: str | None
@@ -260,6 +262,15 @@ class Settings:
                 "BOOKING_PER_DATE_ATTEMPTS",
                 2,
                 min_value=1,
+            ),
+            booking_date_apply_wait_timeout_ms=_env_int(
+                "BOOKING_DATE_APPLY_WAIT_TIMEOUT_MS",
+                15_000,
+                min_value=1_000,
+            ),
+            booking_use_url_date_fallback=_env_bool(
+                "BOOKING_USE_URL_DATE_FALLBACK",
+                True,
             ),
             booking_date_format=_env_optional("BOOKING_DATE_FORMAT") or "%d.%m.%Y",
             booking_type_selector=_env_optional("BOOKING_TYPE_SELECTOR"),

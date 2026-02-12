@@ -7,12 +7,14 @@ import logging
 from pathlib import Path
 import re
 from time import monotonic
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Locator,
     Page,
+    Request,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -30,6 +32,11 @@ OTP_HINT_SNIPPETS = [
     "\u043e\u0434\u043d\u043e\u0440\u0430\u0437\u043e\u0432",
     "\u044f\u043d\u0434\u0435\u043a\u0441 id",
 ]
+
+MAP_MARKER_API_PATHS = (
+    "/api/web/floor/table_markers",
+    "/api/web/floor/room_markers",
+)
 
 
 class BookingError(RuntimeError):
@@ -64,6 +71,17 @@ class BookingResult:
     day_results: list[DayBookingResult]
 
 
+@dataclass(frozen=True)
+class MarkerRequestEvent:
+    path: str
+    method: str
+    date_from: str | None
+    date_to: str | None
+    floor: str | None
+    room_type: str | None
+    captured_at: float
+
+
 class BookingBot:
     def __init__(
         self,
@@ -72,6 +90,7 @@ class BookingBot:
     ) -> None:
         self.settings = settings
         self.notifier = notifier
+        self._marker_requests: list[MarkerRequestEvent] = []
 
     async def book(self) -> BookingResult:
         started_at = datetime.now(timezone.utc)
@@ -86,6 +105,7 @@ class BookingBot:
                 context = await self._new_context(browser)
                 page = await context.new_page()
                 page.on("close", lambda: LOGGER.error("Playwright page was closed unexpectedly."))
+                self._attach_page_trackers(page)
                 page.set_default_timeout(self.settings.default_timeout_ms)
 
                 LOGGER.info("Opening booking page: %s", self.settings.booking_url)
@@ -118,10 +138,11 @@ class BookingBot:
                 booked_dates = [r.date for r in day_results if r.status == "booked"]
                 skipped_dates = [r.date for r in day_results if r.status == "skipped"]
                 failed_dates = [r.date for r in day_results if r.status == "failed"]
-                if not booked_dates and failed_dates:
+                if not booked_dates:
                     raise RuntimeError(
-                        "No bookings created due to errors. "
-                        f"Failed dates: {', '.join(failed_dates)}"
+                        "No bookings were created. "
+                        f"Skipped dates: {', '.join(skipped_dates) or 'n/a'}. "
+                        f"Failed dates: {', '.join(failed_dates) or 'n/a'}"
                     )
 
                 finished_at = datetime.now(timezone.utc)
@@ -435,6 +456,13 @@ class BookingBot:
         )
 
     async def _notify_day_result(self, result: DayBookingResult) -> None:
+        LOGGER.info(
+            "Day result: date=%s status=%s attempt=%s message=%s",
+            result.date,
+            result.status,
+            result.attempt,
+            result.message,
+        )
         if not (self.notifier and self.notifier.enabled):
             return
         icon = {"booked": "✅", "skipped": "⚪", "failed": "❌"}.get(result.status, "ℹ️")
@@ -604,6 +632,215 @@ class BookingBot:
 
         await page.wait_for_timeout(2_000)
 
+    def _attach_page_trackers(self, page: Page) -> None:
+        page.on("requestfinished", self._on_request_finished)
+
+    def _on_request_finished(self, request: Request) -> None:
+        try:
+            self._record_marker_request(request)
+        except Exception:
+            LOGGER.debug("Failed to inspect request for marker sync.", exc_info=True)
+
+    def _record_marker_request(self, request: Request) -> None:
+        parsed = urlparse(request.url)
+        if parsed.path not in MAP_MARKER_API_PATHS:
+            return
+
+        query = parse_qs(parsed.query)
+        event = MarkerRequestEvent(
+            path=parsed.path,
+            method=request.method,
+            date_from=self._first_query_value(query, "date_from"),
+            date_to=self._first_query_value(query, "date_to"),
+            floor=self._first_query_value(query, "floor"),
+            room_type=self._first_query_value(query, "room_type"),
+            captured_at=monotonic(),
+        )
+        self._marker_requests.append(event)
+        if len(self._marker_requests) > 200:
+            self._marker_requests = self._marker_requests[-200:]
+        LOGGER.debug(
+            "Map marker request captured: path=%s date_from=%s date_to=%s floor=%s room_type=%s",
+            event.path,
+            event.date_from,
+            event.date_to,
+            event.floor,
+            event.room_type,
+        )
+
+    @staticmethod
+    def _first_query_value(values: dict[str, list[str]], key: str) -> str | None:
+        raw = values.get(key)
+        if not raw:
+            return None
+        value = str(raw[0]).strip()
+        return value or None
+
+    @staticmethod
+    def _extract_iso_date(value: str | None) -> str | None:
+        if not value:
+            return None
+        match = re.search(r"(\d{4}-\d{2}-\d{2})", value)
+        if not match:
+            return None
+        return match.group(1)
+
+    def _find_matching_marker_request(
+        self,
+        target_iso: str,
+        since: float = 0.0,
+    ) -> MarkerRequestEvent | None:
+        for event in reversed(self._marker_requests):
+            if event.captured_at < since:
+                break
+            date_from_iso = self._extract_iso_date(event.date_from)
+            date_to_iso = self._extract_iso_date(event.date_to)
+            if date_from_iso == target_iso and date_to_iso == target_iso:
+                return event
+        return None
+
+    def _current_map_date_from_url(self, page: Page) -> str | None:
+        parsed = urlparse(page.url)
+        if "/map" not in parsed.path:
+            return None
+        query = parse_qs(parsed.query)
+        return self._extract_iso_date(self._first_query_value(query, "date_from"))
+
+    async def _wait_for_target_date_state(
+        self,
+        page: Page,
+        target_date: date,
+        since: float,
+        timeout_ms: int | None = None,
+    ) -> bool:
+        target_iso = target_date.strftime("%Y-%m-%d")
+        wait_ms = timeout_ms or self.settings.booking_date_apply_wait_timeout_ms
+        deadline = monotonic() + wait_ms / 1000.0
+
+        while monotonic() < deadline:
+            marker_event = self._find_matching_marker_request(target_iso=target_iso, since=since)
+            if marker_event is not None:
+                LOGGER.info(
+                    "Date %s confirmed by marker request (%s).",
+                    target_iso,
+                    marker_event.path,
+                )
+                return True
+
+            url_iso = self._current_map_date_from_url(page)
+            if url_iso == target_iso:
+                LOGGER.info("Date %s confirmed by map URL parameters.", target_iso)
+                return True
+
+            label_date = await self._read_selected_date_from_ui(page)
+            if label_date == target_date:
+                LOGGER.info("Date %s confirmed by date label in UI.", target_iso)
+                return True
+
+            await page.wait_for_timeout(180)
+
+        LOGGER.warning("Target date %s was not confirmed by UI/network state.", target_iso)
+        return False
+
+    async def _read_selected_date_from_ui(self, page: Page) -> date | None:
+        text = await self._read_selected_date_text(page)
+        if not text:
+            return None
+        return self._parse_date_text(text)
+
+    async def _read_selected_date_text(self, page: Page) -> str | None:
+        selectors: list[str] = []
+        if self.settings.booking_date_input_selector:
+            selectors.append(self.settings.booking_date_input_selector)
+        if self.settings.booking_params_open_selector:
+            selectors.append(self.settings.booking_params_open_selector)
+        selectors.extend(
+            [
+                '[role="listbox"] [role="option"][aria-selected="true"] [data-testid="Day"]',
+                '[role="listbox"] [role="option"][aria-selected="true"]',
+            ]
+        )
+
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=500)
+            except Exception:
+                continue
+
+            try:
+                tag_name = (await locator.evaluate("el => el.tagName.toLowerCase()")).strip()
+            except Exception:
+                tag_name = ""
+
+            text: str | None = None
+            try:
+                if tag_name in {"input", "textarea"}:
+                    text = await locator.input_value()
+                else:
+                    text = await locator.inner_text()
+            except Exception:
+                text = None
+
+            normalized = " ".join((text or "").split())
+            if normalized:
+                return normalized
+        return None
+
+    def _parse_date_text(self, raw_text: str) -> date | None:
+        text = " ".join(raw_text.split()).lower()
+
+        dotted_match = re.search(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{4})\b", text)
+        if dotted_match:
+            day = int(dotted_match.group(1))
+            month = int(dotted_match.group(2))
+            year = int(dotted_match.group(3))
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+
+        month_map = {
+            "янв": 1,
+            "фев": 2,
+            "мар": 3,
+            "апр": 4,
+            "мая": 5,
+            "май": 5,
+            "июн": 6,
+            "июл": 7,
+            "авг": 8,
+            "сен": 9,
+            "окт": 10,
+            "ноя": 11,
+            "дек": 12,
+        }
+        named_match = re.search(r"\b(\d{1,2})\s+([а-яё]{3,})\b", text)
+        if not named_match:
+            return None
+
+        day = int(named_match.group(1))
+        month_token = named_match.group(2)
+        month = None
+        for prefix, value in month_map.items():
+            if month_token.startswith(prefix):
+                month = value
+                break
+        if month is None:
+            return None
+
+        today = date.today()
+        year = today.year
+        if month < today.month - 10:
+            year += 1
+        elif month > today.month + 10:
+            year -= 1
+
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
+
     async def _click_selector(self, page: Page, selector: str) -> None:
         locator = page.locator(selector).first
         try:
@@ -638,23 +875,103 @@ class BookingBot:
         await self._click_locator(page, locator)
 
     async def _select_booking_date(self, page: Page, target_date: date) -> bool:
-        if not await self._open_date_picker_for_target(page):
+        target_iso = target_date.strftime("%Y-%m-%d")
+
+        current_url_iso = self._current_map_date_from_url(page)
+        if current_url_iso == target_iso:
+            LOGGER.info("Target date %s is already set in URL.", target_iso)
+            return True
+
+        current_ui_date = await self._read_selected_date_from_ui(page)
+        if current_ui_date == target_date:
+            LOGGER.info("Target date %s is already selected in UI.", target_iso)
+            return True
+
+        for attempt in range(1, 4):
+            attempt_started = monotonic()
+            click_status = await self._try_click_target_date_in_calendar(page, target_date)
+            if click_status == "disabled":
+                LOGGER.info("Target date exists but disabled in calendar: %s", target_iso)
+                return False
+            if click_status == "selected":
+                applied = await self._wait_for_target_date_state(
+                    page=page,
+                    target_date=target_date,
+                    since=attempt_started,
+                )
+                if applied:
+                    return True
+                LOGGER.warning(
+                    "Date click attempt %s/%s did not apply target date %s.",
+                    attempt,
+                    3,
+                    target_iso,
+                )
+
+        if not self.settings.booking_use_url_date_fallback:
             return False
+
+        LOGGER.info("Trying URL date fallback for %s.", target_iso)
+        url_set_started = monotonic()
+        set_by_url = await self._set_date_via_url(page, target_date)
+        if not set_by_url:
+            return False
+        return await self._wait_for_target_date_state(
+            page=page,
+            target_date=target_date,
+            since=url_set_started,
+            timeout_ms=max(
+                self.settings.booking_date_apply_wait_timeout_ms,
+                self.settings.office_map_wait_timeout_ms,
+            ),
+        )
+
+    async def _try_click_target_date_in_calendar(
+        self,
+        page: Page,
+        target_date: date,
+    ) -> str:
+        if not await self._open_date_picker_for_target(page):
+            return "not_found"
 
         iso = target_date.strftime("%Y-%m-%d")
         for month_shift in range(0, 4):
             if await self._click_calendar_iso_cell(page, iso, allow_disabled=False):
-                return True
+                LOGGER.info("Calendar click by ISO selector for %s.", iso)
+                return "selected"
             if await self._click_calendar_iso_cell(page, iso, allow_disabled=True):
-                LOGGER.info("Target date exists but disabled in calendar: %s", iso)
-                return False
+                return "disabled"
             if month_shift >= 3:
                 break
             moved = await self._calendar_next_month(page)
             if not moved:
                 break
 
-        return await self._click_calendar_day_with_fallback(page, target_date.day)
+        if await self._click_calendar_day_with_fallback(page, target_date.day):
+            LOGGER.info(
+                "Calendar click by day fallback for %s (day %s).",
+                iso,
+                target_date.day,
+            )
+            return "selected"
+        return "not_found"
+
+    async def _set_date_via_url(self, page: Page, target_date: date) -> bool:
+        parsed = urlparse(page.url)
+        if "/map" not in parsed.path:
+            return False
+
+        target_iso = target_date.strftime("%Y-%m-%d")
+        query = parse_qs(parsed.query)
+        query["date_from"] = [target_iso]
+        query["date_to"] = [target_iso]
+        new_query = urlencode(query, doseq=True)
+        new_url = urlunparse(parsed._replace(query=new_query))
+
+        LOGGER.info("Reloading map with explicit date params: %s", target_iso)
+        await page.goto(new_url, wait_until="domcontentloaded")
+        await self._wait_for_office_map_ready(page)
+        return True
 
     async def _open_date_picker_for_target(self, page: Page) -> bool:
         if await self._calendar_is_open(page):
@@ -666,12 +983,24 @@ class BookingBot:
                 pass
         if await self._calendar_is_open(page):
             return True
+        if self.settings.booking_date_input_selector:
+            # Some pickers require second click/focus after panel animation.
+            try:
+                await page.locator(self.settings.booking_date_input_selector).first.click(
+                    timeout=2_000
+                )
+                await self._pause(page)
+            except Exception:
+                pass
+        if await self._calendar_is_open(page):
+            return True
         return await self._try_open_date_picker_by_text(page)
 
     async def _calendar_is_open(self, page: Page) -> bool:
         selectors = [
             ".ant-picker-dropdown .ant-picker-content",
             ".ant-picker-panel",
+            '[role="listbox"] [role="option"] [data-testid="Day"]',
             "[class*=\"calendar\"] [role=\"grid\"]",
             "[class*=\"date\"] [role=\"grid\"]",
         ]
@@ -780,7 +1109,12 @@ class BookingBot:
             except Exception:
                 pass
 
+        if await self._click_listbox_day_option(page, day):
+            return True
+
         selectors = [
+            f'[role="listbox"] [role="option"] [data-testid="Day"] span:has-text("{day_str}")',
+            f'[role="listbox"] [role="option"]:has([data-testid="Day"] span:has-text("{day_str}"))',
             ".ant-picker-dropdown .ant-picker-cell:not(.ant-picker-cell-disabled):not(.ant-picker-cell-in-view-false) "
             f".ant-picker-cell-inner:has-text(\"{day_str}\")",
             ".ant-picker-panel .ant-picker-cell:not(.ant-picker-cell-disabled):not(.ant-picker-cell-in-view-false) "
@@ -799,6 +1133,46 @@ class BookingBot:
             except Exception:
                 continue
 
+        return False
+
+    async def _click_listbox_day_option(self, page: Page, day: int) -> bool:
+        try:
+            day_indexes: list[int] = await page.evaluate(
+                """(dayValue) => {
+                    const normalized = String(dayValue);
+                    const options = Array.from(
+                      document.querySelectorAll('[role="listbox"] [role="option"]')
+                    );
+                    const matches = [];
+                    for (let i = 0; i < options.length; i += 1) {
+                      const option = options[i];
+                      const dayNode =
+                        option.querySelector('[data-testid="Day"] span') ||
+                        option.querySelector('[data-testid="Day"]') ||
+                        option.querySelector('span');
+                      const text = (dayNode?.textContent || "").replace(/\\s+/g, " ").trim();
+                      if (text !== normalized) continue;
+                      const classes = `${option.className || ""} ${dayNode?.className || ""}`.toLowerCase();
+                      const disabled = option.getAttribute("aria-disabled") === "true" || classes.includes("disabled");
+                      if (disabled) continue;
+                      matches.push(i);
+                    }
+                    return matches;
+                }""",
+                day,
+            )
+        except Exception:
+            return False
+
+        for idx in day_indexes:
+            locator = page.locator('[role="listbox"] [role="option"]').nth(idx)
+            try:
+                await locator.wait_for(state="visible", timeout=2_000)
+                await self._click_locator(page, locator)
+                LOGGER.info("Calendar day clicked via listbox option index: %s", idx)
+                return True
+            except Exception:
+                continue
         return False
 
     async def _fill_input_like_user(self, page: Page, selector: str, value: str) -> None:
