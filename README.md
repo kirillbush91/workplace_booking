@@ -221,6 +221,19 @@ Outputs:
 - `artifacts/selector_annotations.json`
 - `artifacts/selector_annotations.env`
 
+If UI logic is unstable and you need real behavior telemetry (recommended now):
+
+```bash
+python scripts/behavior_probe.py --url "https://lemana.simple-office-web.liis.su/"
+```
+
+Then perform the whole flow manually in opened browser (login/OTP/office/date/seat/booking) and close browser.
+Artifacts will be created in `artifacts/behavior_probe_YYYYmmdd_HHMMSS/`:
+- `events.jsonl` (clicks + requests + responses + UI snapshots),
+- `summary.json` (endpoint counters),
+- `trace.zip` (open via `playwright show-trace trace.zip`),
+- `session.har` (network HAR, unless `--no-har`).
+
 If you cannot run Playwright locally, use browser DevTools helper:
 
 ```bash

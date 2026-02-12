@@ -62,7 +62,15 @@ class TelegramNotifier:
         while time.monotonic() < deadline:
             remaining = max(1, int(deadline - time.monotonic()))
             timeout = min(poll_timeout_sec, remaining)
-            updates = self._get_updates(timeout=timeout)
+            try:
+                updates = self._get_updates(timeout=timeout)
+            except Exception:
+                LOGGER.warning(
+                    "Telegram getUpdates failed during OTP wait; retrying.",
+                    exc_info=True,
+                )
+                time.sleep(min(2, remaining))
+                continue
             for update in updates:
                 message = update.get("message") or update.get("edited_message")
                 if not isinstance(message, dict):

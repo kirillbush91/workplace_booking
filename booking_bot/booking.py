@@ -308,11 +308,15 @@ class BookingBot:
                 self.notifier.wait_for_otp_code,
                 max(1, self.settings.otp_wait_timeout_ms // 1000),
             )
-            if not code:
-                raise RuntimeError("OTP code was not received from Telegram.")
-            await otp_input.click()
-            await page.keyboard.press("Control+A")
-            await page.keyboard.type(code)
+            if code:
+                await otp_input.click()
+                await page.keyboard.press("Control+A")
+                await page.keyboard.type(code)
+            else:
+                LOGGER.warning(
+                    "OTP code was not received from Telegram in time. "
+                    "Waiting for manual OTP entry in browser."
+                )
         else:
             LOGGER.info(
                 "Waiting for manual OTP entry up to %s ms.",
@@ -549,23 +553,38 @@ class BookingBot:
         if self.settings.booking_type_selector and (
             self.settings.booking_type_option_selector or self.settings.booking_type_value
         ):
-            await self._click_selector(page, self.settings.booking_type_selector)
-            if self.settings.booking_type_option_selector:
-                await self._click_selector(page, self.settings.booking_type_option_selector)
-            elif self.settings.booking_type_value:
-                await self._click_text(page, self.settings.booking_type_value)
+            type_opened = await self._try_click_selector_optional(
+                page=page,
+                selector=self.settings.booking_type_selector,
+                step_name="booking type selector",
+            )
+            if type_opened:
+                if self.settings.booking_type_option_selector:
+                    await self._try_click_selector_optional(
+                        page=page,
+                        selector=self.settings.booking_type_option_selector,
+                        step_name="booking type option",
+                    )
+                elif self.settings.booking_type_value:
+                    await self._try_click_text_optional(
+                        page=page,
+                        text=self.settings.booking_type_value,
+                        step_name="booking type value",
+                    )
 
         if self.settings.booking_time_from_selector and self.settings.booking_time_from:
-            await self._fill_input_like_user(
+            await self._try_fill_input_optional(
                 page=page,
                 selector=self.settings.booking_time_from_selector,
                 value=self.settings.booking_time_from,
+                step_name="booking time from",
             )
         if self.settings.booking_time_to_selector and self.settings.booking_time_to:
-            await self._fill_input_like_user(
+            await self._try_fill_input_optional(
                 page=page,
                 selector=self.settings.booking_time_to_selector,
                 value=self.settings.booking_time_to,
+                step_name="booking time to",
             )
 
         if self.settings.booking_params_apply_selector:
@@ -874,6 +893,62 @@ class BookingBot:
         await locator.wait_for(state="visible", timeout=wait_timeout)
         await self._click_locator(page, locator)
 
+    async def _try_click_selector_optional(
+        self,
+        page: Page,
+        selector: str,
+        step_name: str,
+    ) -> bool:
+        try:
+            await self._click_selector(page, selector)
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Skipping optional step '%s': selector not usable (%s): %s",
+                step_name,
+                selector,
+                exc,
+            )
+            return False
+
+    async def _try_click_text_optional(
+        self,
+        page: Page,
+        text: str,
+        step_name: str,
+        timeout_ms: int | None = None,
+    ) -> bool:
+        try:
+            await self._click_text(page, text, timeout_ms=timeout_ms)
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Skipping optional step '%s': text click not usable (%s): %s",
+                step_name,
+                text,
+                exc,
+            )
+            return False
+
+    async def _try_fill_input_optional(
+        self,
+        page: Page,
+        selector: str,
+        value: str,
+        step_name: str,
+    ) -> bool:
+        try:
+            await self._fill_input_like_user(page=page, selector=selector, value=value)
+            return True
+        except Exception as exc:
+            LOGGER.warning(
+                "Skipping optional step '%s': input not usable (%s): %s",
+                step_name,
+                selector,
+                exc,
+            )
+            return False
+
     async def _select_booking_date(self, page: Page, target_date: date) -> bool:
         target_iso = target_date.strftime("%Y-%m-%d")
 
@@ -934,6 +1009,38 @@ class BookingBot:
         if not await self._open_date_picker_for_target(page):
             return "not_found"
 
+        if await self._has_listbox_calendar(page):
+            if await self._click_listbox_day_option(page, target_date.day):
+                LOGGER.info(
+                    "Calendar click by listbox day for %s (day %s).",
+                    target_date.strftime("%Y-%m-%d"),
+                    target_date.day,
+                )
+                return "selected"
+
+            # For listbox calendars avoid blind month iteration:
+            # shift month only when current selected month differs from target.
+            current_selected_date = await self._read_selected_date_from_ui(page)
+            if current_selected_date and (
+                current_selected_date.year != target_date.year
+                or current_selected_date.month != target_date.month
+            ):
+                for _ in range(2):
+                    if not await self._calendar_next_month(page):
+                        break
+                    if await self._click_listbox_day_option(page, target_date.day):
+                        LOGGER.info(
+                            "Calendar click by listbox day after month shift for %s.",
+                            target_date.strftime("%Y-%m-%d"),
+                        )
+                        return "selected"
+            else:
+                LOGGER.info(
+                    "Listbox calendar is visible and target month matches current; "
+                    "skipping month-switch attempts for %s.",
+                    target_date.strftime("%Y-%m-%d"),
+                )
+
         iso = target_date.strftime("%Y-%m-%d")
         for month_shift in range(0, 4):
             if await self._click_calendar_iso_cell(page, iso, allow_disabled=False):
@@ -955,6 +1062,20 @@ class BookingBot:
             )
             return "selected"
         return "not_found"
+
+    async def _has_listbox_calendar(self, page: Page) -> bool:
+        selectors = [
+            '[role="listbox"] [role="option"] [data-testid="Day"]',
+            '[role="listbox"] [role="option"]',
+        ]
+        for selector in selectors:
+            locator = page.locator(selector).first
+            try:
+                await locator.wait_for(state="visible", timeout=1_000)
+                return True
+            except PlaywrightTimeoutError:
+                continue
+        return False
 
     async def _set_date_via_url(self, page: Page, target_date: date) -> bool:
         parsed = urlparse(page.url)
