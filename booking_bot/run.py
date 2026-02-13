@@ -26,14 +26,23 @@ def _configure_logging(level: str) -> None:
 def _build_success_message(result: BookingResult, attempt: int) -> str:
     duration = (result.finished_at - result.started_at).total_seconds()
     screenshot = str(result.screenshot_path) if result.screenshot_path else "n/a"
+    summary = (
+        "New bookings created"
+        if result.booked_dates
+        else "No new bookings (all target dates skipped)"
+    )
     day_lines = []
     for day in result.day_results:
-        icon = {"booked": "✅", "skipped": "⚪", "failed": "❌"}.get(day.status, "ℹ️")
+        icon = {"booked": "[OK]", "skipped": "[SKIP]", "failed": "[FAIL]"}.get(
+            day.status,
+            "[INFO]",
+        )
         day_lines.append(f"{icon} {day.date} ({day.status}): {day.message}")
     days_block = "\n".join(day_lines) if day_lines else "n/a"
     return (
-        "[workplace-booking] Booking success\n"
+        "[workplace-booking] Booking run finished\n"
         f"Attempt: {attempt}\n"
+        f"Summary: {summary}\n"
         f"Office: {result.office}\n"
         f"Seat: {result.seat}\n"
         f"Booked: {len(result.booked_dates)}\n"
@@ -85,7 +94,13 @@ async def run_once(settings: Settings, notifier: TelegramNotifier) -> int:
         notifier.send(_build_start_message(settings, attempt))
         try:
             result = await BookingBot(settings, notifier=notifier).book()
-            LOGGER.info("Booking created successfully on attempt %s.", attempt)
+            if result.booked_dates:
+                LOGGER.info("Booking created successfully on attempt %s.", attempt)
+            else:
+                LOGGER.info(
+                    "Booking run completed on attempt %s: no new bookings were needed.",
+                    attempt,
+                )
             notifier.send(_build_success_message(result, attempt))
             _send_result_screenshot(notifier, result.screenshot_path)
             return 0

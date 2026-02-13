@@ -140,6 +140,8 @@ class Settings:
     booking_time_to: str | None
 
     seat_search_selector: str | None
+    target_table_id: str | None
+    booking_use_api_submit_fallback: bool
     seat_selector_template: str | None
     seat_canvas_selector: str | None
     seat_canvas_index: int | None
@@ -281,6 +283,11 @@ class Settings:
             booking_time_from=_env_optional("BOOKING_TIME_FROM"),
             booking_time_to=_env_optional("BOOKING_TIME_TO"),
             seat_search_selector=_env_optional("SEAT_SEARCH_SELECTOR"),
+            target_table_id=_env_optional("TARGET_TABLE_ID"),
+            booking_use_api_submit_fallback=_env_bool(
+                "BOOKING_USE_API_SUBMIT_FALLBACK",
+                True,
+            ),
             seat_selector_template=_env_optional("SEAT_SELECTOR_TEMPLATE"),
             seat_canvas_selector=_env_optional("SEAT_CANVAS_SELECTOR"),
             seat_canvas_index=_env_optional_int("SEAT_CANVAS_INDEX", min_value=0),

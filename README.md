@@ -168,6 +168,9 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.
 - `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs.
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
+- `TARGET_TABLE_ID`: exact table UUID for seat (recommended; required for deterministic booking when many places share the same visible number, e.g. multiple `17`).
+- `BOOKING_USE_API_SUBMIT_FALLBACK`: enables API submit via `/api/web/single_booking`.
+  If `TARGET_TABLE_ID` is set, bot uses API path as primary and does not rely on fragile seat/button UI clicks.
 - `SEAT_SELECTOR_TEMPLATE`: selector for seat element.
 - `SEAT_CANVAS_SELECTOR` + `SEAT_CANVAS_INDEX` + `SEAT_CANVAS_X/Y`: fallback for canvas-based seat maps.
 - `BOOK_BUTTON_SELECTOR`: selector for final booking button.

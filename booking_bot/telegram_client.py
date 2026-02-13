@@ -27,20 +27,29 @@ class TelegramNotifier:
             LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")
             return False
 
-        try:
-            self._api_call(
-                method="sendMessage",
-                payload={
-                    "chat_id": str(self.chat_id),
-                    "text": message,
-                    "disable_web_page_preview": "true",
-                },
-                timeout_sec=20,
-            )
-            return True
-        except Exception:
-            LOGGER.exception("Failed to send Telegram notification.")
-            return False
+        for attempt in range(1, 4):
+            try:
+                self._api_call(
+                    method="sendMessage",
+                    payload={
+                        "chat_id": str(self.chat_id),
+                        "text": message,
+                        "disable_web_page_preview": "true",
+                    },
+                    timeout_sec=20,
+                )
+                return True
+            except Exception:
+                if attempt >= 3:
+                    LOGGER.exception("Failed to send Telegram notification.")
+                    return False
+                LOGGER.warning(
+                    "Telegram sendMessage failed on attempt %s/3, retrying.",
+                    attempt,
+                    exc_info=True,
+                )
+                time.sleep(attempt)
+        return False
 
     def wait_for_otp_code(self, timeout_sec: int, poll_timeout_sec: int = 25) -> str | None:
         if not self.enabled:
@@ -113,24 +122,34 @@ class TelegramNotifier:
             file_field_name="document",
             file_path=path,
         )
-        req = request.Request(
-            url=url,
-            data=data,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            method="POST",
-        )
-        try:
-            with request.urlopen(req, timeout=40) as response:
-                raw = response.read().decode("utf-8")
-                if response.status != 200:
-                    raise RuntimeError(f"Telegram API HTTP {response.status}: {raw}")
-                body = json.loads(raw)
-                if not body.get("ok"):
-                    raise RuntimeError(f"Telegram API error: {raw}")
-                return True
-        except Exception:
-            LOGGER.exception("Failed to send Telegram document: %s", path)
-            return False
+        for attempt in range(1, 4):
+            req = request.Request(
+                url=url,
+                data=data,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                method="POST",
+            )
+            try:
+                with request.urlopen(req, timeout=40) as response:
+                    raw = response.read().decode("utf-8")
+                    if response.status != 200:
+                        raise RuntimeError(f"Telegram API HTTP {response.status}: {raw}")
+                    body = json.loads(raw)
+                    if not body.get("ok"):
+                        raise RuntimeError(f"Telegram API error: {raw}")
+                    return True
+            except Exception:
+                if attempt >= 3:
+                    LOGGER.exception("Failed to send Telegram document: %s", path)
+                    return False
+                LOGGER.warning(
+                    "Telegram sendDocument failed on attempt %s/3, retrying: %s",
+                    attempt,
+                    path,
+                    exc_info=True,
+                )
+                time.sleep(attempt)
+        return False
 
     def _extract_six_digit_code(self, text: str) -> str | None:
         direct = re.search(r"(?<!\d)(\d{6})(?!\d)", text)

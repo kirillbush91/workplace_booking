@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 import re
@@ -82,6 +83,14 @@ class MarkerRequestEvent:
     captured_at: float
 
 
+@dataclass(frozen=True)
+class BookingWindow:
+    date_from: str
+    date_to: str
+    floor: str | None
+    room_type: str | None
+
+
 class BookingBot:
     def __init__(
         self,
@@ -91,6 +100,8 @@ class BookingBot:
         self.settings = settings
         self.notifier = notifier
         self._marker_requests: list[MarkerRequestEvent] = []
+        self._resolved_target_table_id: str | None = None
+        self._api_authorization_header: str | None = None
 
     async def book(self) -> BookingResult:
         started_at = datetime.now(timezone.utc)
@@ -104,7 +115,7 @@ class BookingBot:
                 browser = await playwright.chromium.launch(headless=self.settings.headless)
                 context = await self._new_context(browser)
                 page = await context.new_page()
-                page.on("close", lambda: LOGGER.error("Playwright page was closed unexpectedly."))
+                page.on("close", lambda: LOGGER.debug("Playwright page was closed."))
                 self._attach_page_trackers(page)
                 page.set_default_timeout(self.settings.default_timeout_ms)
 
@@ -138,11 +149,16 @@ class BookingBot:
                 booked_dates = [r.date for r in day_results if r.status == "booked"]
                 skipped_dates = [r.date for r in day_results if r.status == "skipped"]
                 failed_dates = [r.date for r in day_results if r.status == "failed"]
-                if not booked_dates:
+                if failed_dates:
                     raise RuntimeError(
-                        "No bookings were created. "
+                        "One or more target dates failed. "
                         f"Skipped dates: {', '.join(skipped_dates) or 'n/a'}. "
-                        f"Failed dates: {', '.join(failed_dates) or 'n/a'}"
+                        f"Failed dates: {', '.join(failed_dates)}"
+                    )
+                if not booked_dates and skipped_dates:
+                    LOGGER.info(
+                        "No new bookings were created; all target dates were skipped "
+                        "(already booked/unavailable)."
                     )
 
                 finished_at = datetime.now(timezone.utc)
@@ -171,17 +187,28 @@ class BookingBot:
             if context is not None:
                 try:
                     await context.storage_state(path=str(self.settings.storage_state_path))
-                except Exception:
-                    LOGGER.exception("Failed to persist browser storage state.")
+                except Exception as exc:
+                    if self._is_target_closed_exception(exc):
+                        LOGGER.warning(
+                            "Skipping storage state persist because browser context is already closed."
+                        )
+                    else:
+                        LOGGER.exception("Failed to persist browser storage state.")
                 try:
                     await context.close()
-                except Exception:
-                    LOGGER.exception("Failed to close browser context cleanly.")
+                except Exception as exc:
+                    if self._is_target_closed_exception(exc):
+                        LOGGER.debug("Browser context was already closed.")
+                    else:
+                        LOGGER.exception("Failed to close browser context cleanly.")
             if browser is not None:
                 try:
                     await browser.close()
-                except Exception:
-                    LOGGER.exception("Failed to close browser cleanly.")
+                except Exception as exc:
+                    if self._is_target_closed_exception(exc):
+                        LOGGER.debug("Browser was already closed.")
+                    else:
+                        LOGGER.exception("Failed to close browser cleanly.")
 
     async def _new_context(self, browser: Browser) -> BrowserContext:
         if self.settings.storage_state_path.exists():
@@ -376,6 +403,28 @@ class BookingBot:
 
     async def _select_office(self, page: Page) -> None:
         LOGGER.info("Selecting office: %s", self.settings.target_office)
+        current_office_id = self._current_office_id_from_map_url(page.url)
+        if current_office_id:
+            target_office_id = self._target_office_id_from_settings()
+            if target_office_id is None or target_office_id == current_office_id:
+                LOGGER.info(
+                    "Already on map with office_id=%s. Skipping office selection click.",
+                    current_office_id,
+                )
+                await self._wait_for_office_map_ready(page)
+                return
+
+            LOGGER.info(
+                "Map is already open with office_id=%s, but target office_id=%s. "
+                "Navigating to /offices for explicit office selection.",
+                current_office_id,
+                target_office_id,
+            )
+            parsed = urlparse(page.url)
+            offices_url = urlunparse(parsed._replace(path="/offices", query="", fragment=""))
+            await page.goto(offices_url, wait_until="domcontentloaded")
+            await self._pause(page)
+
         if self.settings.office_choose_selector:
             await self._click_selector(page, self.settings.office_choose_selector)
             await self._wait_for_office_map_ready(page)
@@ -393,6 +442,28 @@ class BookingBot:
         await self._click_text(page, self.settings.target_office)
         await self._wait_for_office_map_ready(page)
 
+    @staticmethod
+    def _current_office_id_from_map_url(url: str) -> str | None:
+        parsed = urlparse(url)
+        if "/map" not in parsed.path:
+            return None
+        query = parse_qs(parsed.query)
+        raw = query.get("office_id")
+        if not raw:
+            return None
+        value = str(raw[0]).strip()
+        return value or None
+
+    def _target_office_id_from_settings(self) -> str | None:
+        selector = self.settings.office_choose_selector or ""
+        match = re.search(
+            r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})",
+            selector,
+        )
+        if match:
+            return match.group(1).lower()
+        return None
+
     async def _book_single_date(self, page: Page, target: date) -> DayBookingResult:
         date_label = target.strftime(self.settings.booking_date_format)
         max_attempts = self.settings.booking_per_date_attempts
@@ -400,7 +471,50 @@ class BookingBot:
         for attempt in range(1, max_attempts + 1):
             LOGGER.info("Processing date %s (attempt %s/%s).", date_label, attempt, max_attempts)
             try:
-                await self._configure_booking_parameters(page, target_date=target)
+                if self.settings.booking_use_api_submit_fallback:
+                    await self._configure_booking_parameters(
+                        page,
+                        target_date=target,
+                        apply_optional_ui=False,
+                    )
+                    try:
+                        await self._submit_booking_via_api(page, target_date=target)
+                        screenshot = await self._capture_screenshot(
+                            page,
+                            f"success_api_{target.strftime('%Y%m%d')}",
+                        )
+                        result = DayBookingResult(
+                            date=date_label,
+                            status="booked",
+                            message="Booking created via API.",
+                            attempt=attempt,
+                            screenshot_path=screenshot,
+                        )
+                        await self._notify_day_result(result)
+                        return result
+                    except DaySkipError:
+                        raise
+                    except Exception as api_exc:
+                        if page.is_closed():
+                            raise
+                        if self.settings.target_table_id:
+                            # If exact table UUID is configured, API path is the source of truth.
+                            raise
+                        if "set target_table_id" in str(api_exc).lower():
+                            raise DaySkipError(str(api_exc)) from api_exc
+                        LOGGER.warning(
+                            "API booking path failed for %s: %s: %s. "
+                            "Falling back to UI flow.",
+                            date_label,
+                            api_exc.__class__.__name__,
+                            api_exc,
+                        )
+
+                await self._configure_booking_parameters(
+                    page,
+                    target_date=target,
+                    apply_optional_ui=True,
+                )
                 await self._select_seat(page)
                 await self._submit_booking(page)
                 await self._wait_for_success(page)
@@ -412,7 +526,7 @@ class BookingBot:
                 result = DayBookingResult(
                     date=date_label,
                     status="booked",
-                    message="Booking created.",
+                    message="Booking created via UI.",
                     attempt=attempt,
                     screenshot_path=screenshot,
                 )
@@ -508,25 +622,36 @@ class BookingBot:
         self,
         page: Page,
         target_date: date | None = None,
+        apply_optional_ui: bool = True,
     ) -> None:
         has_any_param = any(
             [
-                self.settings.booking_params_open_selector,
                 self.settings.booking_date_input_selector,
-                self.settings.booking_type_selector
+                self.settings.booking_date_values,
+                self.settings.booking_date_value,
+                self.settings.booking_date_offset_days is not None,
+                self.settings.booking_use_url_date_fallback,
+                apply_optional_ui
+                and self.settings.booking_params_open_selector,
+                apply_optional_ui
+                and self.settings.booking_type_selector
                 and (
                     self.settings.booking_type_option_selector
                     or self.settings.booking_type_value
                 ),
-                self.settings.booking_time_from_selector and self.settings.booking_time_from,
-                self.settings.booking_time_to_selector and self.settings.booking_time_to,
+                apply_optional_ui
+                and self.settings.booking_time_from_selector
+                and self.settings.booking_time_from,
+                apply_optional_ui
+                and self.settings.booking_time_to_selector
+                and self.settings.booking_time_to,
             ]
         )
         if not has_any_param:
             return
 
         LOGGER.info("Configuring booking parameters.")
-        if self.settings.booking_params_open_selector:
+        if apply_optional_ui and self.settings.booking_params_open_selector:
             try:
                 await self._click_selector(page, self.settings.booking_params_open_selector)
             except RuntimeError as exc:
@@ -549,6 +674,9 @@ class BookingBot:
                     f"Date {resolved_target_date.strftime(self.settings.booking_date_format)} "
                     "is not available in calendar."
                 )
+
+        if not apply_optional_ui:
+            return
 
         if self.settings.booking_type_selector and (
             self.settings.booking_type_option_selector or self.settings.booking_type_value
@@ -588,9 +716,17 @@ class BookingBot:
             )
 
         if self.settings.booking_params_apply_selector:
-            await self._click_selector(page, self.settings.booking_params_apply_selector)
+            await self._try_click_selector_optional(
+                page=page,
+                selector=self.settings.booking_params_apply_selector,
+                step_name="booking params apply",
+            )
         elif self.settings.booking_params_close_selector:
-            await self._click_selector(page, self.settings.booking_params_close_selector)
+            await self._try_click_selector_optional(
+                page=page,
+                selector=self.settings.booking_params_close_selector,
+                step_name="booking params close",
+            )
 
     async def _select_seat(self, page: Page) -> None:
         LOGGER.info("Selecting seat: %s", self.settings.target_seat)
@@ -621,7 +757,11 @@ class BookingBot:
     async def _submit_booking(self, page: Page) -> None:
         LOGGER.info("Submitting booking.")
         if self.settings.book_button_selector:
-            await self._click_selector(page, self.settings.book_button_selector)
+            await self._click_selector(
+                page,
+                self.settings.book_button_selector,
+                timeout_ms=min(self.settings.default_timeout_ms, 8_000),
+            )
             return
 
         last_exception: Exception | None = None
@@ -635,6 +775,322 @@ class BookingBot:
             "Booking button not found for selected date/seat. "
             "Likely no available slot."
         ) from last_exception
+
+    async def _submit_booking_via_api(self, page: Page, target_date: date) -> None:
+        target_iso = target_date.strftime("%Y-%m-%d")
+        window = self._resolve_booking_window_for_date(target_date)
+        if window is None:
+            raise RuntimeError(
+                f"Could not determine marker date window for {target_iso}. "
+                "Map marker requests were not captured."
+            )
+
+        table_id = await self._resolve_target_table_id_for_date(
+            page=page,
+            target_date=target_date,
+            window=window,
+        )
+        payload = {
+            "table": table_id,
+            "date_from": window.date_from,
+            "date_to": window.date_to,
+        }
+        LOGGER.info(
+            "Submitting booking via API for %s: table=%s date_from=%s date_to=%s",
+            target_iso,
+            table_id,
+            window.date_from,
+            window.date_to,
+        )
+        response = await self._api_fetch(
+            page=page,
+            path="/api/web/single_booking",
+            method="POST",
+            body=payload,
+        )
+        body_text = response.get("text", "")
+        status = int(response.get("status", 0))
+        if status in {200, 201}:
+            LOGGER.info("API booking created successfully (status=%s).", status)
+            self._resolved_target_table_id = table_id
+            return
+
+        message = self._extract_api_error_message(body_text)
+        normalized = message.lower()
+        skip_hints = (
+            "already",
+            "not available",
+            "busy",
+            "overbook",
+            "already booked",
+            "занят",
+            "недоступ",
+            "уже",
+            "превыш",
+        )
+        if status in {400, 404, 409, 422} and any(hint in normalized for hint in skip_hints):
+            raise DaySkipError(
+                f"Seat {self.settings.target_seat} is unavailable for {target_iso}: "
+                f"{message or f'HTTP {status}'}"
+            )
+
+        raise RuntimeError(
+            "API booking request failed: "
+            f"HTTP {status}, response={message or body_text[:300] or '<empty>'}"
+        )
+
+    def _resolve_booking_window_for_date(self, target_date: date) -> BookingWindow | None:
+        target_iso = target_date.strftime("%Y-%m-%d")
+        matching_event = self._find_matching_marker_request(target_iso=target_iso, since=0.0)
+        if matching_event and matching_event.date_from and matching_event.date_to:
+            return BookingWindow(
+                date_from=matching_event.date_from,
+                date_to=matching_event.date_to,
+                floor=matching_event.floor,
+                room_type=matching_event.room_type,
+            )
+
+        latest = self._latest_marker_request_with_window()
+        if latest and latest.date_from and latest.date_to:
+            return BookingWindow(
+                date_from=self._replace_iso_date(latest.date_from, target_iso),
+                date_to=self._replace_iso_date(latest.date_to, target_iso),
+                floor=latest.floor,
+                room_type=latest.room_type,
+            )
+        return None
+
+    def _latest_marker_request_with_window(self) -> MarkerRequestEvent | None:
+        for event in reversed(self._marker_requests):
+            if event.path != "/api/web/floor/table_markers":
+                continue
+            if not event.date_from or not event.date_to:
+                continue
+            return event
+        for event in reversed(self._marker_requests):
+            if not event.date_from or not event.date_to:
+                continue
+            return event
+        return None
+
+    @staticmethod
+    def _replace_iso_date(value: str, target_iso: str) -> str:
+        replaced = re.sub(r"\d{4}-\d{2}-\d{2}", target_iso, value, count=1)
+        return replaced if replaced else target_iso
+
+    async def _resolve_target_table_id_for_date(
+        self,
+        page: Page,
+        target_date: date,
+        window: BookingWindow,
+    ) -> str:
+        if self.settings.target_table_id:
+            return self.settings.target_table_id
+        if self._resolved_target_table_id:
+            return self._resolved_target_table_id
+
+        markers = await self._fetch_table_markers(page=page, window=window)
+        target_seat = str(self.settings.target_seat).strip()
+        candidates: list[dict] = []
+        for marker in markers:
+            title = str(marker.get("table_title", "")).strip()
+            if title != target_seat:
+                continue
+            permit_value = marker.get("has_permit_for_booking")
+            has_permit = True if permit_value is None else self._to_bool(permit_value)
+            if not has_permit:
+                continue
+            candidates.append(marker)
+
+        by_table_id: dict[str, dict] = {}
+        for marker in candidates:
+            table_id = str(marker.get("table_id", "")).strip()
+            if not table_id:
+                continue
+            previous = by_table_id.get(table_id)
+            if previous is None:
+                by_table_id[table_id] = marker
+                continue
+            if self._to_bool(marker.get("is_available")) and not self._to_bool(
+                previous.get("is_available")
+            ):
+                by_table_id[table_id] = marker
+
+        unique_candidates = list(by_table_id.values())
+        available = [
+            marker for marker in unique_candidates if self._to_bool(marker.get("is_available"))
+        ]
+        if not available:
+            raise DaySkipError(
+                f"Seat {target_seat} is not available for "
+                f"{target_date.strftime(self.settings.booking_date_format)}."
+            )
+
+        if len(available) == 1:
+            resolved = str(available[0].get("table_id"))
+            self._resolved_target_table_id = resolved
+            return resolved
+
+        if window.room_type:
+            same_room_type = [
+                marker
+                for marker in available
+                if str(marker.get("room_type_id", "")).strip() == str(window.room_type).strip()
+            ]
+            if len(same_room_type) == 1:
+                resolved = str(same_room_type[0].get("table_id"))
+                self._resolved_target_table_id = resolved
+                return resolved
+
+        unique_ids = sorted(
+            {str(marker.get("table_id", "")).strip() for marker in available if marker.get("table_id")}
+        )
+        raise RuntimeError(
+            "Seat number is ambiguous across multiple desks. "
+            f"Set TARGET_TABLE_ID. Candidates for seat {target_seat}: {', '.join(unique_ids[:8])}"
+        )
+
+    async def _fetch_table_markers(self, page: Page, window: BookingWindow) -> list[dict]:
+        query: dict[str, str] = {
+            "date_from": window.date_from,
+            "date_to": window.date_to,
+        }
+        if window.floor:
+            query["floor"] = window.floor
+        if window.room_type is not None:
+            query["room_type"] = window.room_type
+
+        url = self._build_api_url(page, "/api/web/floor/table_markers", query=query)
+        response = await self._api_fetch(
+            page=page,
+            path="/api/web/floor/table_markers",
+            method="GET",
+            query=query,
+        )
+        text = response.get("text", "")
+        status = int(response.get("status", 0))
+        if status != 200:
+            raise RuntimeError(
+                "Failed to fetch table markers for target date: "
+                f"HTTP {status}, url={url}"
+            )
+        payload = response.get("json")
+        if not isinstance(payload, dict):
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Table markers response is not valid JSON.") from exc
+        markers = payload.get("table_markers")
+        if not isinstance(markers, list):
+            raise RuntimeError("Table markers response does not contain 'table_markers' list.")
+        return markers
+
+    @staticmethod
+    def _to_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return False
+
+    def _build_api_url(
+        self,
+        page: Page,
+        path: str,
+        query: dict[str, str] | None = None,
+    ) -> str:
+        parsed = urlparse(page.url or self.settings.booking_url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if query:
+            return f"{origin}{path}?{urlencode(query)}"
+        return f"{origin}{path}"
+
+    async def _api_fetch(
+        self,
+        page: Page,
+        path: str,
+        method: str = "GET",
+        query: dict[str, str] | None = None,
+        body: dict[str, object] | None = None,
+    ) -> dict:
+        headers: dict[str, str] = {"accept": "application/json"}
+        if self._api_authorization_header:
+            headers["authorization"] = self._api_authorization_header
+
+        response = await page.evaluate(
+            """async ({path, method, query, body, headers}) => {
+              const url = new URL(path, window.location.origin);
+              if (query) {
+                for (const [key, value] of Object.entries(query)) {
+                  if (value === null || value === undefined) continue;
+                  url.searchParams.set(key, String(value));
+                }
+              }
+              const init = {
+                method: method || "GET",
+                credentials: "include",
+                headers: { ...(headers || {}) },
+              };
+              if (body && typeof body === "object") {
+                init.headers["content-type"] = "application/json";
+                init.body = JSON.stringify(body);
+              }
+              const res = await fetch(url.toString(), init);
+              const text = await res.text();
+              let json = null;
+              try {
+                json = text ? JSON.parse(text) : null;
+              } catch (_err) {
+                json = null;
+              }
+              return {
+                url: url.toString(),
+                ok: res.ok,
+                status: res.status,
+                text,
+                json,
+              };
+            }""",
+            {
+                "path": path,
+                "method": method,
+                "query": query or {},
+                "body": body,
+                "headers": headers,
+            },
+        )
+        if not isinstance(response, dict):
+            raise RuntimeError("Unexpected API fetch response shape.")
+        return response
+
+    @staticmethod
+    def _extract_api_error_message(raw_text: str) -> str:
+        text = (raw_text or "").strip()
+        if not text:
+            return ""
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return text
+
+        if isinstance(payload, dict):
+            for key in ("message", "detail", "error", "description"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            nested = payload.get("errors")
+            if isinstance(nested, list) and nested:
+                first = nested[0]
+                if isinstance(first, str):
+                    return first
+                if isinstance(first, dict):
+                    for key in ("message", "detail", "error"):
+                        value = first.get(key)
+                        if isinstance(value, str) and value.strip():
+                            return value.strip()
+        return text
 
     async def _wait_for_success(self, page: Page) -> None:
         LOGGER.info("Waiting for booking success indicator.")
@@ -664,6 +1120,17 @@ class BookingBot:
         parsed = urlparse(request.url)
         if parsed.path not in MAP_MARKER_API_PATHS:
             return
+
+        headers: dict[str, str] = {}
+        try:
+            raw_headers = request.headers
+            if isinstance(raw_headers, dict):
+                headers = {str(k).lower(): str(v) for k, v in raw_headers.items()}
+        except Exception:
+            headers = {}
+        auth_header = headers.get("authorization")
+        if auth_header:
+            self._api_authorization_header = auth_header
 
         query = parse_qs(parsed.query)
         event = MarkerRequestEvent(
@@ -860,10 +1327,16 @@ class BookingBot:
         except ValueError:
             return None
 
-    async def _click_selector(self, page: Page, selector: str) -> None:
+    async def _click_selector(
+        self,
+        page: Page,
+        selector: str,
+        timeout_ms: int | None = None,
+    ) -> None:
         locator = page.locator(selector).first
+        wait_timeout = timeout_ms or self.settings.default_timeout_ms
         try:
-            await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
+            await locator.wait_for(state="visible", timeout=wait_timeout)
             await self._click_locator(page, locator)
         except PlaywrightTimeoutError as exc:
             raise RuntimeError(
@@ -962,6 +1435,28 @@ class BookingBot:
             LOGGER.info("Target date %s is already selected in UI.", target_iso)
             return True
 
+        if self.settings.booking_use_url_date_fallback:
+            LOGGER.info("Trying URL date sync first for %s.", target_iso)
+            url_set_started = monotonic()
+            set_by_url = await self._set_date_via_url(page, target_date)
+            if set_by_url:
+                applied_by_url = await self._wait_for_target_date_state(
+                    page=page,
+                    target_date=target_date,
+                    since=url_set_started,
+                    timeout_ms=max(
+                        self.settings.booking_date_apply_wait_timeout_ms,
+                        self.settings.office_map_wait_timeout_ms,
+                    ),
+                )
+                if applied_by_url:
+                    return True
+                LOGGER.warning(
+                    "URL date sync did not confirm target date %s. "
+                    "Trying calendar click fallback.",
+                    target_iso,
+                )
+
         for attempt in range(1, 4):
             attempt_started = monotonic()
             click_status = await self._try_click_target_date_in_calendar(page, target_date)
@@ -983,23 +1478,7 @@ class BookingBot:
                     target_iso,
                 )
 
-        if not self.settings.booking_use_url_date_fallback:
-            return False
-
-        LOGGER.info("Trying URL date fallback for %s.", target_iso)
-        url_set_started = monotonic()
-        set_by_url = await self._set_date_via_url(page, target_date)
-        if not set_by_url:
-            return False
-        return await self._wait_for_target_date_state(
-            page=page,
-            target_date=target_date,
-            since=url_set_started,
-            timeout_ms=max(
-                self.settings.booking_date_apply_wait_timeout_ms,
-                self.settings.office_map_wait_timeout_ms,
-            ),
-        )
+        return False
 
     async def _try_click_target_date_in_calendar(
         self,
@@ -1083,13 +1562,36 @@ class BookingBot:
             return False
 
         target_iso = target_date.strftime("%Y-%m-%d")
+        latest_window = self._latest_marker_request_with_window()
+
+        default_date_from = target_iso
+        default_date_to = target_iso
+        if latest_window and latest_window.date_from and latest_window.date_to:
+            default_date_from = self._replace_iso_date(latest_window.date_from, target_iso)
+            default_date_to = self._replace_iso_date(latest_window.date_to, target_iso)
+
         query = parse_qs(parsed.query)
-        query["date_from"] = [target_iso]
-        query["date_to"] = [target_iso]
+        current_date_from = self._first_query_value(query, "date_from")
+        current_date_to = self._first_query_value(query, "date_to")
+        query["date_from"] = [
+            self._replace_iso_date(current_date_from, target_iso)
+            if current_date_from
+            else default_date_from
+        ]
+        query["date_to"] = [
+            self._replace_iso_date(current_date_to, target_iso)
+            if current_date_to
+            else default_date_to
+        ]
         new_query = urlencode(query, doseq=True)
         new_url = urlunparse(parsed._replace(query=new_query))
 
-        LOGGER.info("Reloading map with explicit date params: %s", target_iso)
+        LOGGER.info(
+            "Reloading map with explicit date params: %s (date_from=%s, date_to=%s)",
+            target_iso,
+            query["date_from"][0],
+            query["date_to"][0],
+        )
         await page.goto(new_url, wait_until="domcontentloaded")
         await self._wait_for_office_map_ready(page)
         return True
@@ -1491,6 +1993,11 @@ class BookingBot:
         if self.settings.booking_date_offset_days is not None:
             return date.today() + timedelta(days=self.settings.booking_date_offset_days)
         return None
+
+    @staticmethod
+    def _is_target_closed_exception(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "target page, context or browser has been closed" in message
 
     async def _pause(self, page: Page) -> None:
         if self.settings.ui_pause_ms > 0:
