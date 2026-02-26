@@ -166,7 +166,9 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - Date selection is state-aware: bot validates target date by map marker requests (`table_markers`/`room_markers`), URL params, and visible date label before continuing.
 - `BOOKING_TYPE_SELECTOR`: booking type chooser opener.
 - `BOOKING_TYPE_OPTION_SELECTOR` or `BOOKING_TYPE_VALUE`: target option in booking type chooser.
-- `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs.
+- `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs (UI path only; API path uses configured time values directly).
+- `BOOKING_TIME_FROM` / `BOOKING_TIME_TO`: target booking interval in local office time (recommended fixed values: `10:00` and `19:00`).
+- `BOOKING_LOCAL_UTC_OFFSET`: office local timezone offset used to convert booking time to UTC for API calls (example `+03:00`).
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
 - `TARGET_TABLE_ID`: exact table UUID for seat (recommended; required for deterministic booking when many places share the same visible number, e.g. multiple `17`).
 - `BOOKING_USE_API_SUBMIT_FALLBACK`: enables API submit via `/api/web/single_booking`.

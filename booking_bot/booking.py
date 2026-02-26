@@ -842,6 +842,19 @@ class BookingBot:
     def _resolve_booking_window_for_date(self, target_date: date) -> BookingWindow | None:
         target_iso = target_date.strftime("%Y-%m-%d")
         matching_event = self._find_matching_marker_request(target_iso=target_iso, since=0.0)
+        base_event = matching_event
+
+        if base_event is None:
+            base_event = self._latest_marker_request_with_window()
+
+        explicit_window = self._configured_booking_window(
+            target_date=target_date,
+            floor=(base_event.floor if base_event else None),
+            room_type=(base_event.room_type if base_event else None),
+        )
+        if explicit_window is not None:
+            return explicit_window
+
         if matching_event and matching_event.date_from and matching_event.date_to:
             return BookingWindow(
                 date_from=matching_event.date_from,
@@ -850,7 +863,7 @@ class BookingBot:
                 room_type=matching_event.room_type,
             )
 
-        latest = self._latest_marker_request_with_window()
+        latest = base_event
         if latest and latest.date_from and latest.date_to:
             return BookingWindow(
                 date_from=self._replace_iso_date(latest.date_from, target_iso),
@@ -859,6 +872,22 @@ class BookingBot:
                 room_type=latest.room_type,
             )
         return None
+
+    def _configured_booking_window(
+        self,
+        target_date: date,
+        floor: str | None,
+        room_type: str | None,
+    ) -> BookingWindow | None:
+        if not self.settings.booking_time_from or not self.settings.booking_time_to:
+            return None
+        date_from, date_to = self._build_target_utc_window_from_settings(target_date)
+        return BookingWindow(
+            date_from=date_from,
+            date_to=date_to,
+            floor=floor,
+            room_type=room_type,
+        )
 
     def _latest_marker_request_with_window(self) -> MarkerRequestEvent | None:
         for event in reversed(self._marker_requests):
@@ -877,6 +906,68 @@ class BookingBot:
     def _replace_iso_date(value: str, target_iso: str) -> str:
         replaced = re.sub(r"\d{4}-\d{2}-\d{2}", target_iso, value, count=1)
         return replaced if replaced else target_iso
+
+    def _build_target_utc_window_from_settings(self, target_date: date) -> tuple[str, str]:
+        start_raw = self.settings.booking_time_from or "10:00"
+        end_raw = self.settings.booking_time_to or "19:00"
+        offset = self._parse_utc_offset(self.settings.booking_local_utc_offset)
+
+        start_h, start_m = self._parse_hhmm(start_raw)
+        end_h, end_m = self._parse_hhmm(end_raw)
+
+        local_start = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            start_h,
+            start_m,
+            tzinfo=offset,
+        )
+        local_end = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            end_h,
+            end_m,
+            tzinfo=offset,
+        )
+        if (end_h, end_m) <= (start_h, start_m):
+            local_end += timedelta(days=1)
+
+        utc_start = local_start.astimezone(timezone.utc)
+        utc_end = local_end.astimezone(timezone.utc)
+        return (
+            utc_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            utc_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+    @staticmethod
+    def _parse_hhmm(value: str) -> tuple[int, int]:
+        match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value or "")
+        if not match:
+            raise RuntimeError(f"Invalid time format '{value}', expected HH:MM.")
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise RuntimeError(f"Invalid time value '{value}', expected HH:MM.")
+        return hour, minute
+
+    @staticmethod
+    def _parse_utc_offset(raw_value: str) -> timezone:
+        value = (raw_value or "").strip()
+        match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", value)
+        if not match:
+            raise RuntimeError(
+                f"Invalid BOOKING_LOCAL_UTC_OFFSET '{raw_value}', expected +HH:MM or -HH:MM."
+            )
+        sign = 1 if match.group(1) == "+" else -1
+        hours = int(match.group(2))
+        minutes = int(match.group(3))
+        if hours > 23 or minutes > 59:
+            raise RuntimeError(
+                f"Invalid BOOKING_LOCAL_UTC_OFFSET '{raw_value}', expected +HH:MM or -HH:MM."
+            )
+        return timezone(sign * timedelta(hours=hours, minutes=minutes))
 
     async def _resolve_target_table_id_for_date(
         self,
@@ -1563,6 +1654,27 @@ class BookingBot:
 
         target_iso = target_date.strftime("%Y-%m-%d")
         latest_window = self._latest_marker_request_with_window()
+
+        explicit_window = self._configured_booking_window(
+            target_date=target_date,
+            floor=(latest_window.floor if latest_window else None),
+            room_type=(latest_window.room_type if latest_window else None),
+        )
+        if explicit_window is not None:
+            query = parse_qs(parsed.query)
+            query["date_from"] = [explicit_window.date_from]
+            query["date_to"] = [explicit_window.date_to]
+            new_query = urlencode(query, doseq=True)
+            new_url = urlunparse(parsed._replace(query=new_query))
+            LOGGER.info(
+                "Reloading map with explicit date/time params: %s (date_from=%s, date_to=%s)",
+                target_iso,
+                explicit_window.date_from,
+                explicit_window.date_to,
+            )
+            await page.goto(new_url, wait_until="domcontentloaded")
+            await self._wait_for_office_map_ready(page)
+            return True
 
         default_date_from = target_iso
         default_date_to = target_iso

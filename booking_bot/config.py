@@ -138,6 +138,7 @@ class Settings:
     booking_time_to_selector: str | None
     booking_time_from: str | None
     booking_time_to: str | None
+    booking_local_utc_offset: str
 
     seat_search_selector: str | None
     target_table_id: str | None
@@ -282,6 +283,9 @@ class Settings:
             booking_time_to_selector=_env_optional("BOOKING_TIME_TO_SELECTOR"),
             booking_time_from=_env_optional("BOOKING_TIME_FROM"),
             booking_time_to=_env_optional("BOOKING_TIME_TO"),
+            booking_local_utc_offset=(
+                _env_optional("BOOKING_LOCAL_UTC_OFFSET") or "+03:00"
+            ),
             seat_search_selector=_env_optional("SEAT_SEARCH_SELECTOR"),
             target_table_id=_env_optional("TARGET_TABLE_ID"),
             booking_use_api_submit_fallback=_env_bool(
