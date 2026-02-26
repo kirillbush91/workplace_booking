@@ -504,6 +504,20 @@ class BookingBot:
         date_label = target.strftime(self.settings.booking_date_format)
         max_attempts = self.settings.booking_per_date_attempts
 
+        if self.settings.booking_skip_weekends and target.weekday() >= 5:
+            result = DayBookingResult(
+                date=date_label,
+                status="skipped",
+                message=(
+                    "Weekend date skipped by policy "
+                    "(BOOKING_SKIP_WEEKENDS=true)."
+                ),
+                attempt=1,
+                screenshot_path=None,
+            )
+            await self._notify_day_result(result)
+            return result
+
         for attempt in range(1, max_attempts + 1):
             LOGGER.info("Processing date %s (attempt %s/%s).", date_label, attempt, max_attempts)
             try:

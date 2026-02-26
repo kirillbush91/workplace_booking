@@ -10,6 +10,7 @@ from urllib import parse, request
 
 
 LOGGER = logging.getLogger(__name__)
+OTP_REMINDER_INTERVAL_SEC = 60 * 60
 
 
 class TelegramNotifier:
@@ -100,7 +101,20 @@ class TelegramNotifier:
         )
 
         deadline = time.monotonic() + timeout_sec
+        next_reminder_at = time.monotonic() + OTP_REMINDER_INTERVAL_SEC
         while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_reminder_at:
+                remaining_sec = max(0, int(deadline - now))
+                remaining_min = max(1, remaining_sec // 60) if remaining_sec else 0
+                self.send(
+                    "[workplace-booking] OTP code is still required.\n"
+                    "Reply in this chat with 6 digits to continue the booking run.\n"
+                    f"Remaining wait time: ~{remaining_min} min."
+                )
+                while next_reminder_at <= now:
+                    next_reminder_at += OTP_REMINDER_INTERVAL_SEC
+
             remaining = max(1, int(deadline - time.monotonic()))
             timeout = min(poll_timeout_sec, remaining)
             try:

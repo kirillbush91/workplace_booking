@@ -263,7 +263,7 @@ class Settings:
                 min_value=0,
             ),
             booking_include_today=_env_bool("BOOKING_INCLUDE_TODAY", True),
-            booking_skip_weekends=_env_bool("BOOKING_SKIP_WEEKENDS", False),
+            booking_skip_weekends=_env_bool("BOOKING_SKIP_WEEKENDS", True),
             booking_per_date_attempts=_env_int(
                 "BOOKING_PER_DATE_ATTEMPTS",
                 2,

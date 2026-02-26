@@ -199,6 +199,40 @@ def _format_local_dt(dt_utc: datetime, offset_raw: str) -> str:
     return f"{local_dt.strftime('%d.%m.%Y %H:%M')} ({offset_raw})"
 
 
+def _weekday_short(value: date) -> str:
+    names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    return names[value.weekday()]
+
+
+def _is_weekend_booking_date(settings: Settings, target: date) -> bool:
+    return bool(settings.booking_skip_weekends and target.weekday() >= 5)
+
+
+def _booking_target_rule_label(settings: Settings) -> str:
+    offset_days = settings.booking_date_offset_days
+    if offset_days is None:
+        offset_days = 7
+    return f"local run date +{offset_days} day(s)"
+
+
+def _build_schedule_preview(settings: Settings, start_run_utc: datetime, count: int = 7) -> str:
+    lines: list[str] = []
+    run_at_utc = start_run_utc
+    for _ in range(max(1, count)):
+        target = _scheduled_target_date_for_run(settings, run_at_utc)
+        target_label = target.strftime(settings.booking_date_format)
+        skip_note = " [weekend skipped]" if _is_weekend_booking_date(settings, target) else ""
+        lines.append(
+            f"- {_format_local_dt(run_at_utc, settings.schedule_local_utc_offset)} "
+            f"-> {target_label} ({_weekday_short(target)}){skip_note}"
+        )
+        run_at_utc = _next_scheduled_run_utc(
+            settings,
+            now_utc=run_at_utc + timedelta(seconds=1),
+        )
+    return "\n".join(lines)
+
+
 def _scheduled_target_date(settings: Settings, now_utc: datetime | None = None) -> date:
     now_utc = now_utc or datetime.now(timezone.utc)
     local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
@@ -256,10 +290,17 @@ def _menu_keyboard_rows() -> list[list[str]]:
 def _date_keyboard_rows(settings: Settings, days: int = 14) -> list[list[str]]:
     local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
     base = datetime.now(timezone.utc).astimezone(local_tz).date()
-    labels = [
-        (base + timedelta(days=offset)).strftime(settings.booking_date_format)
-        for offset in range(0, max(1, days))
-    ]
+    labels: list[str] = []
+    offset = 0
+    target_count = max(1, days)
+    # Extend the scan window when weekend dates are filtered out.
+    max_scan_days = max(target_count * 3, target_count + 14)
+    while len(labels) < target_count and offset < max_scan_days:
+        candidate = base + timedelta(days=offset)
+        offset += 1
+        if _is_weekend_booking_date(settings, candidate):
+            continue
+        labels.append(candidate.strftime(settings.booking_date_format))
     rows: list[list[str]] = []
     row: list[str] = []
     for label in labels:
@@ -328,12 +369,15 @@ def _build_selection_summary(settings: Settings, ui_state: ServiceUiState) -> st
     seat_note = ""
     if chosen_seat != settings.target_seat and settings.target_table_id:
         seat_note = "\nNote: exact TARGET_TABLE_ID is only configured for default seat."
+    weekend_note = ""
+    if ui_state.selected_date and _is_weekend_booking_date(settings, ui_state.selected_date):
+        weekend_note = "\nWarning: selected date is weekend and will be skipped by policy."
     return (
         "[workplace-booking] Manual booking selection\n"
         f"Date: {chosen_date}\n"
         f"Seat: {chosen_seat}\n"
         f"Time: {settings.booking_time_from}-{settings.booking_time_to}"
-        f"{seat_note}"
+        f"{seat_note}{weekend_note}"
     )
 
 
@@ -383,8 +427,13 @@ def _parse_manual_book_date(command_text: str, settings: Settings) -> date | Non
 
 
 def _build_status_message(settings: Settings, next_run_utc: datetime) -> str:
-    local_tz = settings.schedule_local_utc_offset
     scheduled_target = _scheduled_target_date_for_run(settings, next_run_utc)
+    weekend_policy = (
+        "skip Saturday/Sunday targets (no booking attempt)"
+        if settings.booking_skip_weekends
+        else "weekend targets are allowed"
+    )
+    next_run_utc_label = next_run_utc.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
     return (
         "[workplace-booking] Status\n"
         f"Mode: {settings.run_mode}\n"
@@ -392,8 +441,15 @@ def _build_status_message(settings: Settings, next_run_utc: datetime) -> str:
         f"Seat: {settings.target_seat}\n"
         f"Target time (local): {settings.booking_time_from}-{settings.booking_time_to}\n"
         f"Office timezone: {settings.booking_local_utc_offset}\n"
-        f"Next scheduled run: {_format_local_dt(next_run_utc, local_tz)}\n"
-        f"Scheduled target date (+7): {scheduled_target.strftime(settings.booking_date_format)}"
+        f"Scheduler: every day at {settings.schedule_time_local} ({settings.schedule_local_utc_offset})\n"
+        f"Target date rule: {_booking_target_rule_label(settings)}\n"
+        f"Weekend policy: {weekend_policy}\n"
+        f"OTP wait timeout: {settings.otp_wait_timeout_ms // 60000} min (reminders every 60 min while waiting)\n"
+        f"Next scheduled run (local): {_format_local_dt(next_run_utc, settings.schedule_local_utc_offset)}\n"
+        f"Next scheduled run (UTC): {next_run_utc_label} (+00:00)\n"
+        f"Next scheduled target: {scheduled_target.strftime(settings.booking_date_format)} ({_weekday_short(scheduled_target)})\n"
+        "Upcoming schedule preview:\n"
+        f"{_build_schedule_preview(settings, next_run_utc, count=7)}"
     )
 
 
@@ -403,6 +459,14 @@ async def _run_manual_booking_for_date(
     target_date: date,
     target_seat: str | None = None,
 ) -> int:
+    if _is_weekend_booking_date(base_settings, target_date):
+        notifier.send(
+            "[workplace-booking] Manual booking skipped by policy\n"
+            f"Date: {target_date.strftime(base_settings.booking_date_format)} ({_weekday_short(target_date)})\n"
+            "Reason: weekend bookings are disabled (BOOKING_SKIP_WEEKENDS=true)."
+        )
+        return 0
+
     manual_settings = _settings_for_manual_request(
         base_settings,
         target=target_date,
@@ -632,15 +696,26 @@ async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
     while True:
         now_utc = datetime.now(timezone.utc)
         if now_utc >= next_run_utc:
-            target = _scheduled_target_date(settings, now_utc=now_utc)
-            scheduled_settings = _settings_for_single_date(settings, target)
-            notifier.send(
-                "[workplace-booking] Scheduled run started\n"
-                f"Target date: {target.strftime(settings.booking_date_format)}\n"
-                f"Seat: {settings.target_seat}\n"
-                f"Time: {settings.booking_time_from}-{settings.booking_time_to}"
-            )
-            await run_once(scheduled_settings, notifier)
+            target = _scheduled_target_date_for_run(settings, next_run_utc)
+            if _is_weekend_booking_date(settings, target):
+                LOGGER.info(
+                    "Scheduled run skipped: target date %s is weekend and BOOKING_SKIP_WEEKENDS=true.",
+                    target.strftime(settings.booking_date_format),
+                )
+                notifier.send(
+                    "[workplace-booking] Scheduled run skipped by policy\n"
+                    f"Target date: {target.strftime(settings.booking_date_format)} ({_weekday_short(target)})\n"
+                    "Reason: weekend bookings are disabled (BOOKING_SKIP_WEEKENDS=true)."
+                )
+            else:
+                scheduled_settings = _settings_for_single_date(settings, target)
+                notifier.send(
+                    "[workplace-booking] Scheduled run started\n"
+                    f"Target date: {target.strftime(settings.booking_date_format)} ({_weekday_short(target)})\n"
+                    f"Seat: {settings.target_seat}\n"
+                    f"Time: {settings.booking_time_from}-{settings.booking_time_to}"
+                )
+                await run_once(scheduled_settings, notifier)
             next_run_utc = _next_scheduled_run_utc(
                 settings,
                 now_utc=datetime.now(timezone.utc) + timedelta(seconds=1),
