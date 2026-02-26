@@ -102,6 +102,7 @@ class BookingBot:
         self._marker_requests: list[MarkerRequestEvent] = []
         self._resolved_target_table_id: str | None = None
         self._api_authorization_header: str | None = None
+        self._storage_state_saved_at_least_once = False
 
     async def book(self) -> BookingResult:
         started_at = datetime.now(timezone.utc)
@@ -130,6 +131,11 @@ class BookingBot:
 
                 await self._perform_pre_login_actions(page)
                 await self._login_if_needed(page)
+                await self._persist_storage_state_safe(
+                    context,
+                    phase="post-login",
+                    target_closed_level="debug",
+                )
                 await self._select_office(page)
                 target_dates = self._resolve_target_dates()
                 if not target_dates:
@@ -161,6 +167,12 @@ class BookingBot:
                         "(already booked/unavailable)."
                     )
 
+                await self._persist_storage_state_safe(
+                    context,
+                    phase="before-return",
+                    target_closed_level="debug",
+                )
+
                 finished_at = datetime.now(timezone.utc)
                 return BookingResult(
                     started_at=started_at,
@@ -185,15 +197,13 @@ class BookingBot:
             ) from exc
         finally:
             if context is not None:
-                try:
-                    await context.storage_state(path=str(self.settings.storage_state_path))
-                except Exception as exc:
-                    if self._is_target_closed_exception(exc):
-                        LOGGER.warning(
-                            "Skipping storage state persist because browser context is already closed."
-                        )
-                    else:
-                        LOGGER.exception("Failed to persist browser storage state.")
+                await self._persist_storage_state_safe(
+                    context,
+                    phase="finalize",
+                    target_closed_level=(
+                        "debug" if self._storage_state_saved_at_least_once else "warning"
+                    ),
+                )
                 try:
                     await context.close()
                 except Exception as exc:
@@ -209,6 +219,32 @@ class BookingBot:
                         LOGGER.debug("Browser was already closed.")
                     else:
                         LOGGER.exception("Failed to close browser cleanly.")
+
+    async def _persist_storage_state_safe(
+        self,
+        context: BrowserContext,
+        *,
+        phase: str,
+        target_closed_level: str = "warning",
+    ) -> bool:
+        try:
+            await context.storage_state(path=str(self.settings.storage_state_path))
+            self._storage_state_saved_at_least_once = True
+            LOGGER.debug("Browser storage state persisted (%s): %s", phase, self.settings.storage_state_path)
+            return True
+        except Exception as exc:
+            if self._is_target_closed_exception(exc):
+                message = (
+                    "Skipping storage state persist because browser context is already closed "
+                    f"({phase})."
+                )
+                if target_closed_level == "debug":
+                    LOGGER.debug(message)
+                else:
+                    LOGGER.warning(message)
+                return False
+            LOGGER.exception("Failed to persist browser storage state (%s).", phase)
+            return False
 
     async def _new_context(self, browser: Browser) -> BrowserContext:
         if self.settings.storage_state_path.exists():
@@ -2243,10 +2279,10 @@ class BookingBot:
                         text_lower = text.lower()
                         if self.settings.target_seat not in text:
                             continue
-                        if time_from and time_from not in text:
-                            continue
-                        if time_to and time_to not in text:
-                            continue
+                        # Bookings page may show time in GMT0 instead of local office time.
+                        # Date + seat is the primary discriminator. Time is best-effort only.
+                        if time_from and time_from in text and time_to and time_to in text:
+                            pass
                         if not any(v.lower() in text_lower for v in date_text_variants):
                             continue
                         box = await item.bounding_box()
@@ -2257,6 +2293,14 @@ class BookingBot:
                 if scroll_step < 11:
                     await tmp_page.mouse.wheel(0, 1400)
                     await tmp_page.wait_for_timeout(350)
+
+            # Fallback: find target date text, scroll to it, screenshot nearest container.
+            if await self._capture_bookings_viewport_near_date(
+                page=tmp_page,
+                date_text_variants=date_text_variants,
+                screenshot_path=screenshot_path,
+            ):
+                return True
 
             # Fallback: find target date text, scroll to it, screenshot nearest container.
             for variant in date_text_variants:
@@ -2296,6 +2340,59 @@ class BookingBot:
                 except Exception:
                     pass
 
+    async def _capture_bookings_viewport_near_date(
+        self,
+        page: Page,
+        date_text_variants: list[str],
+        screenshot_path: Path,
+    ) -> bool:
+        for _ in range(16):
+            for variant in date_text_variants:
+                if len(variant.strip()) < 4:
+                    continue
+                try:
+                    locator = page.get_by_text(variant, exact=False).first
+                    await locator.wait_for(state="visible", timeout=600)
+                    await locator.scroll_into_view_if_needed(timeout=1_500)
+                    await page.wait_for_timeout(350)
+                    if await self._capture_viewport_around_locator(page, locator, screenshot_path):
+                        return True
+                except Exception:
+                    continue
+            await page.mouse.wheel(0, 1200)
+            await page.wait_for_timeout(300)
+        return False
+
+    async def _capture_viewport_around_locator(
+        self,
+        page: Page,
+        locator: Locator,
+        screenshot_path: Path,
+    ) -> bool:
+        try:
+            box = await locator.bounding_box()
+            if not box:
+                return False
+            viewport = page.viewport_size
+            if not viewport:
+                viewport = await page.evaluate(
+                    "() => ({ width: window.innerWidth || 1280, height: window.innerHeight || 720 })"
+                )
+            width = int(max(320, min(int(viewport["width"]), 1600)))
+            height = int(max(300, min(int(viewport["height"]), 900)))
+            clip_y = max(0, float(box["y"]) - 120)
+            clip_x = 0.0
+            clip = {
+                "x": clip_x,
+                "y": clip_y,
+                "width": float(width),
+                "height": float(height),
+            }
+            await page.screenshot(path=str(screenshot_path), clip=clip)
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _build_booking_date_search_variants(target_date: date) -> list[str]:
         ru_months = [
@@ -2312,13 +2409,30 @@ class BookingBot:
             "ноября",
             "декабря",
         ]
+        en_months = [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ]
         month_name = ru_months[target_date.month - 1]
+        en_month_name = en_months[target_date.month - 1]
         variants = [
             target_date.strftime("%d.%m.%Y"),
             target_date.strftime("%d.%m"),
             target_date.strftime("%Y-%m-%d"),
             f"{target_date.day} {month_name}",
             f"{target_date.day} {month_name[:3]}",
+            f"{target_date.day} {en_month_name}",
+            f"{target_date.day} {en_month_name[:3]}",
         ]
         # Preserve order while removing duplicates.
         out: list[str] = []
