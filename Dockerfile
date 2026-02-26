@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.51.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
 
 WORKDIR /app
 
@@ -8,4 +8,3 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY booking_bot /app/booking_bot
 
 CMD ["python", "-m", "booking_bot"]
-

@@ -40,6 +40,7 @@ Fill `.env`:
 - add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for alerts.
 - set `OTP_CODE_INPUT_SELECTOR` for OTP screen.  
   If `OTP_CODE_VALUE` is empty, bot will request OTP code in Telegram and wait for your reply.
+- `.env` is local-only and must not be committed to git (use `.env.example` as template).
 
 Run once:
 
