@@ -2217,47 +2217,66 @@ class BookingBot:
             except Exception:
                 pass
 
-            date_text_variants = [
-                target_date.strftime("%d.%m.%Y"),
-                str(target_date.day),
-            ]
+            date_text_variants = self._build_booking_date_search_variants(target_date)
             time_from = (self.settings.booking_time_from or "").strip()
             time_to = (self.settings.booking_time_to or "").strip()
-            search_texts = [
-                txt for txt in [self.settings.target_seat, time_from, time_to] if txt
-            ]
-            search_texts.extend(date_text_variants)
 
             selectors = [
                 "article",
                 '[role="listitem"]',
                 '[class*="booking"]',
-                "main",
             ]
-            for selector in selectors:
-                locator = tmp_page.locator(selector)
-                count = min(await locator.count(), 20)
-                for idx in range(count):
-                    item = locator.nth(idx)
-                    try:
-                        await item.wait_for(state="visible", timeout=500)
-                        text = " ".join((await item.inner_text()).split())
-                    except Exception:
-                        continue
-                    if not text:
-                        continue
-                    if self.settings.target_seat not in text:
-                        continue
-                    if time_from and time_from not in text:
-                        continue
-                    if time_to and time_to not in text:
-                        continue
-                    if not any(v in text for v in date_text_variants):
-                        continue
-                    box = await item.bounding_box()
+            for scroll_step in range(12):
+                for selector in selectors:
+                    locator = tmp_page.locator(selector)
+                    count = min(await locator.count(), 120)
+                    for idx in range(count):
+                        item = locator.nth(idx)
+                        try:
+                            await item.scroll_into_view_if_needed(timeout=700)
+                            await item.wait_for(state="visible", timeout=700)
+                            text = " ".join((await item.inner_text()).split())
+                        except Exception:
+                            continue
+                        if not text:
+                            continue
+                        text_lower = text.lower()
+                        if self.settings.target_seat not in text:
+                            continue
+                        if time_from and time_from not in text:
+                            continue
+                        if time_to and time_to not in text:
+                            continue
+                        if not any(v.lower() in text_lower for v in date_text_variants):
+                            continue
+                        box = await item.bounding_box()
+                        if box and box["width"] >= 220 and box["height"] >= 120:
+                            await tmp_page.wait_for_timeout(250)
+                            await item.screenshot(path=str(screenshot_path))
+                            return True
+                if scroll_step < 11:
+                    await tmp_page.mouse.wheel(0, 1400)
+                    await tmp_page.wait_for_timeout(350)
+
+            # Fallback: find target date text, scroll to it, screenshot nearest container.
+            for variant in date_text_variants:
+                if len(variant.strip()) < 4:
+                    continue
+                try:
+                    date_loc = tmp_page.get_by_text(variant, exact=False).first
+                    await date_loc.wait_for(state="visible", timeout=1_500)
+                    await date_loc.scroll_into_view_if_needed(timeout=1_500)
+                    container = date_loc.locator(
+                        'xpath=ancestor::*[self::article or @role="listitem" or contains(@class,"booking")][1]'
+                    ).first
+                    box = await container.bounding_box()
                     if box and box["width"] >= 220 and box["height"] >= 120:
-                        await item.screenshot(path=str(screenshot_path))
+                        await tmp_page.wait_for_timeout(250)
+                        await container.screenshot(path=str(screenshot_path))
                         return True
+                except Exception:
+                    continue
+
             # Fallback: capture bookings page viewport instead of map zoom-out.
             main_locator = tmp_page.locator("main").first
             try:
@@ -2276,6 +2295,41 @@ class BookingBot:
                     await tmp_page.close()
                 except Exception:
                     pass
+
+    @staticmethod
+    def _build_booking_date_search_variants(target_date: date) -> list[str]:
+        ru_months = [
+            "января",
+            "февраля",
+            "марта",
+            "апреля",
+            "мая",
+            "июня",
+            "июля",
+            "августа",
+            "сентября",
+            "октября",
+            "ноября",
+            "декабря",
+        ]
+        month_name = ru_months[target_date.month - 1]
+        variants = [
+            target_date.strftime("%d.%m.%Y"),
+            target_date.strftime("%d.%m"),
+            target_date.strftime("%Y-%m-%d"),
+            f"{target_date.day} {month_name}",
+            f"{target_date.day} {month_name[:3]}",
+        ]
+        # Preserve order while removing duplicates.
+        out: list[str] = []
+        seen: set[str] = set()
+        for item in variants:
+            key = item.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
 
     async def _capture_screenshot(self, page: Page, prefix: str) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

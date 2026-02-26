@@ -22,20 +22,24 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
-    def send(self, message: str) -> bool:
+    def send(self, message: str, reply_markup: dict[str, object] | None = None) -> bool:
         if not self.enabled:
             LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")
             return False
+
+        payload = {
+            "chat_id": str(self.chat_id),
+            "text": message,
+            "disable_web_page_preview": "true",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
 
         for attempt in range(1, 4):
             try:
                 self._api_call(
                     method="sendMessage",
-                    payload={
-                        "chat_id": str(self.chat_id),
-                        "text": message,
-                        "disable_web_page_preview": "true",
-                    },
+                    payload=payload,
                     timeout_sec=20,
                 )
                 return True
@@ -50,6 +54,34 @@ class TelegramNotifier:
                 )
                 time.sleep(attempt)
         return False
+
+    def send_reply_keyboard(
+        self,
+        message: str,
+        rows: list[list[str]],
+        *,
+        resize_keyboard: bool = True,
+        one_time_keyboard: bool = False,
+        selective: bool = False,
+    ) -> bool:
+        keyboard = [[{"text": str(item)} for item in row] for row in rows if row]
+        return self.send(
+            message,
+            reply_markup={
+                "keyboard": keyboard,
+                "resize_keyboard": bool(resize_keyboard),
+                "one_time_keyboard": bool(one_time_keyboard),
+                "selective": bool(selective),
+            },
+        )
+
+    def send_remove_keyboard(self, message: str) -> bool:
+        return self.send(
+            message,
+            reply_markup={
+                "remove_keyboard": True,
+            },
+        )
 
     def wait_for_otp_code(self, timeout_sec: int, poll_timeout_sec: int = 25) -> str | None:
         if not self.enabled:

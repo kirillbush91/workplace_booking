@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 import logging
 from pathlib import Path
@@ -16,6 +16,25 @@ from .telegram_client import TelegramNotifier
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+BTN_MENU = "📋 Меню"
+BTN_STATUS = "📊 Статус"
+BTN_RUN_NEXT = "🚀 Забронировать +7"
+BTN_PICK_DATE = "📅 Выбрать дату"
+BTN_PICK_SEAT = "💺 Выбрать место"
+BTN_RUN_SELECTED = "✅ Запустить выбранное"
+BTN_RESET_SELECTIONS = "♻️ Сбросить выбор"
+BTN_BACK = "↩️ Назад"
+BTN_CANCEL = "❌ Отмена"
+BTN_ENTER_SEAT = "⌨️ Ввести номер места"
+
+
+@dataclass
+class ServiceUiState:
+    selected_date: date | None = None
+    selected_seat: str | None = None
+    pending_input: str | None = None
 
 
 def _configure_logging(level: str) -> None:
@@ -207,15 +226,139 @@ def _settings_for_single_date(settings: Settings, target: date) -> Settings:
     )
 
 
+def _settings_for_manual_request(
+    settings: Settings,
+    target: date,
+    target_seat: str | None = None,
+) -> Settings:
+    out = _settings_for_single_date(settings, target)
+    if target_seat is None:
+        return out
+    seat = str(target_seat).strip()
+    if not seat:
+        return out
+    if seat == out.target_seat:
+        return out
+    # Exact table UUID is seat-specific. When seat is changed interactively, resolve by UI/API
+    # markers again instead of reusing the fixed table id for the default seat.
+    return replace(out, target_seat=seat, target_table_id=None)
+
+
+def _menu_keyboard_rows() -> list[list[str]]:
+    return [
+        [BTN_RUN_NEXT, BTN_STATUS],
+        [BTN_PICK_DATE, BTN_PICK_SEAT],
+        [BTN_RUN_SELECTED, BTN_RESET_SELECTIONS],
+        ["/help", "/ping"],
+    ]
+
+
+def _date_keyboard_rows(settings: Settings, days: int = 14) -> list[list[str]]:
+    local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
+    base = datetime.now(timezone.utc).astimezone(local_tz).date()
+    labels = [
+        (base + timedelta(days=offset)).strftime(settings.booking_date_format)
+        for offset in range(0, max(1, days))
+    ]
+    rows: list[list[str]] = []
+    row: list[str] = []
+    for label in labels:
+        row.append(label)
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([BTN_BACK, BTN_CANCEL])
+    return rows
+
+
+def _seat_keyboard_rows(settings: Settings) -> list[list[str]]:
+    current = settings.target_seat.strip()
+    rows: list[list[str]] = []
+    if current.isdigit():
+        center = int(current)
+        values = []
+        for seat in range(max(1, center - 8), center + 9):
+            values.append(f"💺 {seat}")
+        row: list[str] = []
+        for value in values:
+            row.append(value)
+            if len(row) == 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+    else:
+        rows.append([f"💺 {current}"])
+    rows.append([BTN_ENTER_SEAT])
+    rows.append([BTN_BACK, BTN_CANCEL])
+    return rows
+
+
+def _effective_selected_seat(settings: Settings, ui_state: ServiceUiState) -> str:
+    return (ui_state.selected_seat or settings.target_seat).strip()
+
+
+def _parse_date_text(text: str, settings: Settings) -> date | None:
+    raw = (text or "").strip()
+    try:
+        return datetime.strptime(raw, settings.booking_date_format).date()
+    except ValueError:
+        return None
+
+
+def _parse_seat_text(text: str) -> str | None:
+    raw = (text or "").strip()
+    if raw.startswith("/seat"):
+        parts = raw.split(maxsplit=1)
+        if len(parts) == 2:
+            raw = parts[1].strip()
+        else:
+            return None
+    match = re.search(r"(?<!\d)(\d{1,4})(?!\d)", raw)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _build_selection_summary(settings: Settings, ui_state: ServiceUiState) -> str:
+    chosen_date = ui_state.selected_date.strftime(settings.booking_date_format) if ui_state.selected_date else "not selected (uses +7)"
+    chosen_seat = _effective_selected_seat(settings, ui_state)
+    seat_note = ""
+    if chosen_seat != settings.target_seat and settings.target_table_id:
+        seat_note = "\nNote: exact TARGET_TABLE_ID is only configured for default seat."
+    return (
+        "[workplace-booking] Manual booking selection\n"
+        f"Date: {chosen_date}\n"
+        f"Seat: {chosen_seat}\n"
+        f"Time: {settings.booking_time_from}-{settings.booking_time_to}"
+        f"{seat_note}"
+    )
+
+
+def _send_service_menu(
+    notifier: TelegramNotifier,
+    settings: Settings,
+    ui_state: ServiceUiState,
+    *,
+    message: str | None = None,
+) -> None:
+    text = message or _build_selection_summary(settings, ui_state)
+    notifier.send_reply_keyboard(text, _menu_keyboard_rows())
+
+
 def _build_service_help() -> str:
     return (
         "[workplace-booking] Telegram commands\n"
         "/help - show commands\n"
+        "/menu - show buttons/menu\n"
         "/status - show bot status and next scheduled run\n"
         "/run - run booking now using scheduled +7 logic\n"
         "/booknext - run booking now for date +7\n"
         "/book DD.MM.YYYY - run booking now for exact date\n"
         "/book +N - run booking now for offset days (example /book +7)\n"
+        "/seat N - set seat for manual runs (example /seat 17)\n"
         "/ping - health check"
     )
 
@@ -258,12 +401,17 @@ async def _run_manual_booking_for_date(
     base_settings: Settings,
     notifier: TelegramNotifier,
     target_date: date,
+    target_seat: str | None = None,
 ) -> int:
-    manual_settings = _settings_for_single_date(base_settings, target_date)
+    manual_settings = _settings_for_manual_request(
+        base_settings,
+        target=target_date,
+        target_seat=target_seat,
+    )
     notifier.send(
         "[workplace-booking] Manual booking requested\n"
         f"Date: {target_date.strftime(base_settings.booking_date_format)}\n"
-        f"Seat: {base_settings.target_seat}\n"
+        f"Seat: {manual_settings.target_seat}\n"
         f"Time: {base_settings.booking_time_from}-{base_settings.booking_time_to}"
     )
     return await run_once(manual_settings, notifier)
@@ -274,27 +422,144 @@ async def _handle_service_command(
     settings: Settings,
     notifier: TelegramNotifier,
     next_run_utc: datetime,
+    ui_state: ServiceUiState,
 ) -> tuple[bool, datetime]:
     normalized = (text or "").strip()
     if not normalized:
         return False, next_run_utc
+    lowered = normalized.lower()
 
-    if normalized.startswith("/help"):
-        notifier.send(_build_service_help())
+    if normalized in {BTN_CANCEL, BTN_BACK}:
+        ui_state.pending_input = None
+        _send_service_menu(
+            notifier,
+            settings,
+            ui_state,
+            message="[workplace-booking] Selection menu",
+        )
         return False, next_run_utc
 
-    if normalized.startswith("/status") or normalized.startswith("/schedule"):
-        notifier.send(_build_status_message(settings, next_run_utc))
+    if normalized.startswith("/start") or normalized.startswith("/menu") or normalized == BTN_MENU:
+        ui_state.pending_input = None
+        _send_service_menu(notifier, settings, ui_state)
+        return False, next_run_utc
+
+    if normalized.startswith("/help"):
+        notifier.send_reply_keyboard(_build_service_help(), _menu_keyboard_rows())
+        return False, next_run_utc
+
+    if (
+        normalized.startswith("/status")
+        or normalized.startswith("/schedule")
+        or normalized == BTN_STATUS
+    ):
+        notifier.send_reply_keyboard(
+            _build_status_message(settings, next_run_utc)
+            + "\n\n"
+            + _build_selection_summary(settings, ui_state),
+            _menu_keyboard_rows(),
+        )
+        return False, next_run_utc
+
+    if normalized == BTN_PICK_DATE:
+        ui_state.pending_input = "date"
+        notifier.send_reply_keyboard(
+            "[workplace-booking] Choose booking date",
+            _date_keyboard_rows(settings, days=14),
+        )
+        return False, next_run_utc
+
+    if normalized == BTN_PICK_SEAT:
+        ui_state.pending_input = "seat"
+        notifier.send_reply_keyboard(
+            "[workplace-booking] Choose seat number",
+            _seat_keyboard_rows(settings),
+        )
+        return False, next_run_utc
+
+    if normalized == BTN_ENTER_SEAT:
+        ui_state.pending_input = "seat"
+        notifier.send_reply_keyboard(
+            "[workplace-booking] Send seat number as text (example: 17).",
+            [[BTN_BACK, BTN_CANCEL]],
+        )
+        return False, next_run_utc
+
+    chosen_date = _parse_date_text(normalized, settings)
+    if chosen_date is not None and ui_state.pending_input in {None, "date"}:
+        ui_state.selected_date = chosen_date
+        ui_state.pending_input = None
+        _send_service_menu(
+            notifier,
+            settings,
+            ui_state,
+            message=(
+                "[workplace-booking] Date selected\n"
+                f"Date: {chosen_date.strftime(settings.booking_date_format)}"
+            ),
+        )
+        return False, next_run_utc
+
+    if normalized.startswith("/seat") or (
+        ui_state.pending_input == "seat" and normalized and not normalized.startswith("/")
+    ):
+        seat = _parse_seat_text(normalized)
+        if seat is None:
+            notifier.send_reply_keyboard(
+                "[workplace-booking] Invalid seat number. Send only the seat number, for example: 17",
+                [[BTN_BACK, BTN_CANCEL]],
+            )
+            return False, next_run_utc
+        ui_state.selected_seat = seat
+        ui_state.pending_input = None
+        _send_service_menu(
+            notifier,
+            settings,
+            ui_state,
+            message=f"[workplace-booking] Seat selected\nSeat: {seat}",
+        )
         return False, next_run_utc
 
     if normalized.startswith("/run") and not normalized.startswith("/runtime"):
         target = _scheduled_target_date(settings)
-        await _run_manual_booking_for_date(settings, notifier, target)
+        await _run_manual_booking_for_date(
+            settings,
+            notifier,
+            target,
+            target_seat=_effective_selected_seat(settings, ui_state),
+        )
         return True, next_run_utc
 
-    if normalized.startswith("/booknext"):
+    if normalized.startswith("/booknext") or normalized == BTN_RUN_NEXT:
         target = _scheduled_target_date(settings)
-        await _run_manual_booking_for_date(settings, notifier, target)
+        await _run_manual_booking_for_date(
+            settings,
+            notifier,
+            target,
+            target_seat=_effective_selected_seat(settings, ui_state),
+        )
+        return True, next_run_utc
+
+    if normalized == BTN_RESET_SELECTIONS:
+        ui_state.selected_date = None
+        ui_state.selected_seat = None
+        ui_state.pending_input = None
+        _send_service_menu(
+            notifier,
+            settings,
+            ui_state,
+            message="[workplace-booking] Manual selection reset. Default settings will be used.",
+        )
+        return False, next_run_utc
+
+    if normalized == BTN_RUN_SELECTED:
+        target = ui_state.selected_date or _scheduled_target_date(settings)
+        await _run_manual_booking_for_date(
+            settings,
+            notifier,
+            target,
+            target_seat=_effective_selected_seat(settings, ui_state),
+        )
         return True, next_run_utc
 
     if normalized.startswith("/book"):
@@ -305,29 +570,61 @@ async def _handle_service_command(
                 f"Use /book {datetime.now().strftime(settings.booking_date_format)} or /book +7"
             )
             return False, next_run_utc
-        await _run_manual_booking_for_date(settings, notifier, target)
+        await _run_manual_booking_for_date(
+            settings,
+            notifier,
+            target,
+            target_seat=_effective_selected_seat(settings, ui_state),
+        )
         return True, next_run_utc
 
     if normalized.startswith("/ping"):
-        notifier.send("[workplace-booking] pong")
+        notifier.send_reply_keyboard("[workplace-booking] pong", _menu_keyboard_rows())
         return False, next_run_utc
+
+    if ui_state.pending_input == "date":
+        notifier.send_reply_keyboard(
+            (
+                "[workplace-booking] Invalid date format.\n"
+                f"Use {datetime.now().strftime(settings.booking_date_format)} (DD.MM.YYYY)"
+            ),
+            _date_keyboard_rows(settings, days=14),
+        )
+        return False, next_run_utc
+
+    if lowered in {"дата", "место", "статус", "меню"}:
+        mapping = {
+            "дата": BTN_PICK_DATE,
+            "место": BTN_PICK_SEAT,
+            "статус": BTN_STATUS,
+            "меню": BTN_MENU,
+        }
+        return await _handle_service_command(
+            mapping[lowered],
+            settings,
+            notifier,
+            next_run_utc,
+            ui_state,
+        )
 
     return False, next_run_utc
 
 
 async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
     next_run_utc = _next_scheduled_run_utc(settings)
+    ui_state = ServiceUiState()
     LOGGER.info(
         "Running in service mode. Next scheduled run at %s UTC (%s local).",
         next_run_utc.isoformat(),
         _format_local_dt(next_run_utc, settings.schedule_local_utc_offset),
     )
     if notifier.enabled:
-        notifier.send(
+        notifier.send_reply_keyboard(
             "[workplace-booking] Service mode started\n"
             f"Next scheduled run: {_format_local_dt(next_run_utc, settings.schedule_local_utc_offset)}\n"
             f"Scheduled target date (+7): {_scheduled_target_date_for_run(settings, next_run_utc).strftime(settings.booking_date_format)}\n"
-            "Send /help for commands."
+            "Use the buttons below or send /help for commands.",
+            _menu_keyboard_rows(),
         )
     else:
         LOGGER.warning("Service mode is running without Telegram notifications/commands.")
@@ -370,6 +667,7 @@ async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
                     settings=settings,
                     notifier=notifier,
                     next_run_utc=next_run_utc,
+                    ui_state=ui_state,
                 )
                 if handled:
                     # Keep existing schedule; manual runs should not shift the nightly trigger.
