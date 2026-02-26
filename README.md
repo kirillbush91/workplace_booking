@@ -9,7 +9,7 @@ The bot:
 - books date range from today up to `+7` days by default,
 - clicks booking controls in UI,
 - sends Telegram notification on success/failure,
-- sends confirmation screenshot file to Telegram,
+- sends confirmation screenshot file to Telegram (focused modal/booking card when possible),
 - saves screenshot and browser session state for debugging and re-use.
 
 ## 1) Quick start (local)
@@ -169,6 +169,7 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_TIME_FROM_SELECTOR` / `BOOKING_TIME_TO_SELECTOR`: time range inputs (UI path only; API path uses configured time values directly).
 - `BOOKING_TIME_FROM` / `BOOKING_TIME_TO`: target booking interval in local office time (recommended fixed values: `10:00` and `19:00`).
 - `BOOKING_LOCAL_UTC_OFFSET`: office local timezone offset used to convert booking time to UTC for API calls (example `+03:00`).
+- API booking path validates the outgoing UTC window against configured local time before submit. If the window does not match, the run fails instead of creating a wrong-time booking.
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
 - `TARGET_TABLE_ID`: exact table UUID for seat (recommended; required for deterministic booking when many places share the same visible number, e.g. multiple `17`).
 - `BOOKING_USE_API_SUBMIT_FALLBACK`: enables API submit via `/api/web/single_booking`.
@@ -287,6 +288,9 @@ Messages include:
 
 - `RUN_MODE=once`: one run, with internal retries (`RETRY_ATTEMPTS`, `RETRY_DELAY_SEC`).
 - `RUN_MODE=daemon`: infinite loop, runs every `RUN_INTERVAL_MINUTES`.
+- `RUN_MODE=service`: long-running scheduler + Telegram commands.
+  Uses `SCHEDULE_TIME_LOCAL` and `SCHEDULE_LOCAL_UTC_OFFSET` for nightly run timing.
+  Telegram commands: `/help`, `/status`, `/run`, `/booknext`, `/book DD.MM.YYYY`, `/book +7`, `/ping`.
 
 ## 6) Docker run
 
@@ -305,13 +309,14 @@ Use any Linux VPS:
 3. run `docker compose up -d --build`;
 4. container restarts automatically on reboot (`restart: unless-stopped`).
 
-If you prefer no daemon loop, set `RUN_MODE=once` and trigger by OS scheduler:
+If you prefer no internal scheduler/service loop, set `RUN_MODE=once` and trigger by OS scheduler:
 - cron (Linux),
 - Task Scheduler (Windows).
 
 Ready-made `systemd` templates are provided:
 - `deploy/systemd/workplace-booking.service`
 - `deploy/systemd/workplace-booking.timer`
+- `deploy/systemd/workplace-booking-bot.service` (recommended for `RUN_MODE=service`)
 
 ### VPS quick deployment (Ubuntu 22.04/24.04, 4 GB RAM)
 
@@ -343,8 +348,14 @@ nano .env
 Set at least:
 - `TARGET_OFFICE`
 - `TARGET_SEAT`
-- `RUN_MODE=daemon`
-- `RUN_INTERVAL_MINUTES=30` (or your interval)
+- `RUN_MODE=service`
+- `SCHEDULE_TIME_LOCAL=00:01`
+- `SCHEDULE_LOCAL_UTC_OFFSET=+03:00`
+- `BOOKING_DATE_VALUES=` (empty)
+- `BOOKING_DATE_OFFSET_DAYS=7`
+- `BOOKING_TIME_FROM=10:00`
+- `BOOKING_TIME_TO=19:00`
+- `BOOKING_LOCAL_UTC_OFFSET=+03:00`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
@@ -357,6 +368,15 @@ docker compose logs -f workplace-booking
 ```
 
 5. Auto-restart after reboot is already enabled by Compose (`restart: unless-stopped`).
+
+Optional systemd wrapper for long-running service mode:
+
+```bash
+sudo cp deploy/systemd/workplace-booking-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now workplace-booking-bot.service
+sudo systemctl status workplace-booking-bot.service
+```
 
 ## 8) Free cloud deployment (typical pattern)
 

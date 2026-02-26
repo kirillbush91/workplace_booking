@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 import logging
 from pathlib import Path
+import re
 import traceback
 
 from dotenv import load_dotenv
@@ -131,6 +133,255 @@ async def run_daemon(settings: Settings, notifier: TelegramNotifier) -> int:
         await asyncio.sleep(sleep_seconds)
 
 
+def _parse_utc_offset(value: str) -> timezone:
+    raw = (value or "").strip()
+    match = re.fullmatch(r"([+-])(\d{2}):(\d{2})", raw)
+    if not match:
+        raise ValueError(f"Invalid UTC offset '{value}', expected +HH:MM or -HH:MM")
+    sign = 1 if match.group(1) == "+" else -1
+    hours = int(match.group(2))
+    minutes = int(match.group(3))
+    if hours > 23 or minutes > 59:
+        raise ValueError(f"Invalid UTC offset '{value}', expected +HH:MM or -HH:MM")
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def _parse_hhmm(value: str) -> dt_time:
+    raw = (value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
+    if not match:
+        raise ValueError(f"Invalid time '{value}', expected HH:MM")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Invalid time '{value}', expected HH:MM")
+    return dt_time(hour=hour, minute=minute)
+
+
+def _next_scheduled_run_utc(settings: Settings, now_utc: datetime | None = None) -> datetime:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
+    local_now = now_utc.astimezone(local_tz)
+    schedule_time = _parse_hhmm(settings.schedule_time_local)
+    local_candidate = local_now.replace(
+        hour=schedule_time.hour,
+        minute=schedule_time.minute,
+        second=0,
+        microsecond=0,
+    )
+    if local_candidate <= local_now:
+        local_candidate += timedelta(days=1)
+    return local_candidate.astimezone(timezone.utc)
+
+
+def _format_local_dt(dt_utc: datetime, offset_raw: str) -> str:
+    local_tz = _parse_utc_offset(offset_raw)
+    local_dt = dt_utc.astimezone(local_tz)
+    return f"{local_dt.strftime('%d.%m.%Y %H:%M')} ({offset_raw})"
+
+
+def _scheduled_target_date(settings: Settings, now_utc: datetime | None = None) -> date:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
+    local_today = now_utc.astimezone(local_tz).date()
+    offset_days = settings.booking_date_offset_days
+    if offset_days is None:
+        offset_days = 7
+    return local_today + timedelta(days=offset_days)
+
+
+def _scheduled_target_date_for_run(settings: Settings, run_at_utc: datetime) -> date:
+    # Service mode runs after local midnight (e.g. 00:01), so the target date must be
+    # calculated from the local date of that scheduled run, not from "now".
+    return _scheduled_target_date(settings, now_utc=run_at_utc)
+
+
+def _settings_for_single_date(settings: Settings, target: date) -> Settings:
+    formatted = target.strftime(settings.booking_date_format)
+    return replace(
+        settings,
+        booking_date_values=[formatted],
+        booking_date_value=None,
+        booking_date_offset_days=None,
+        booking_range_days=0,
+    )
+
+
+def _build_service_help() -> str:
+    return (
+        "[workplace-booking] Telegram commands\n"
+        "/help - show commands\n"
+        "/status - show bot status and next scheduled run\n"
+        "/run - run booking now using scheduled +7 logic\n"
+        "/booknext - run booking now for date +7\n"
+        "/book DD.MM.YYYY - run booking now for exact date\n"
+        "/book +N - run booking now for offset days (example /book +7)\n"
+        "/ping - health check"
+    )
+
+
+def _parse_manual_book_date(command_text: str, settings: Settings) -> date | None:
+    text = command_text.strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    arg = parts[1].strip()
+    if not arg:
+        return None
+    if re.fullmatch(r"\+\d{1,3}", arg):
+        offset_days = int(arg[1:])
+        local_tz = _parse_utc_offset(settings.schedule_local_utc_offset)
+        base_date = datetime.now(timezone.utc).astimezone(local_tz).date()
+        return base_date + timedelta(days=offset_days)
+    try:
+        return datetime.strptime(arg, settings.booking_date_format).date()
+    except ValueError:
+        return None
+
+
+def _build_status_message(settings: Settings, next_run_utc: datetime) -> str:
+    local_tz = settings.schedule_local_utc_offset
+    scheduled_target = _scheduled_target_date_for_run(settings, next_run_utc)
+    return (
+        "[workplace-booking] Status\n"
+        f"Mode: {settings.run_mode}\n"
+        f"Office: {settings.target_office}\n"
+        f"Seat: {settings.target_seat}\n"
+        f"Target time (local): {settings.booking_time_from}-{settings.booking_time_to}\n"
+        f"Office timezone: {settings.booking_local_utc_offset}\n"
+        f"Next scheduled run: {_format_local_dt(next_run_utc, local_tz)}\n"
+        f"Scheduled target date (+7): {scheduled_target.strftime(settings.booking_date_format)}"
+    )
+
+
+async def _run_manual_booking_for_date(
+    base_settings: Settings,
+    notifier: TelegramNotifier,
+    target_date: date,
+) -> int:
+    manual_settings = _settings_for_single_date(base_settings, target_date)
+    notifier.send(
+        "[workplace-booking] Manual booking requested\n"
+        f"Date: {target_date.strftime(base_settings.booking_date_format)}\n"
+        f"Seat: {base_settings.target_seat}\n"
+        f"Time: {base_settings.booking_time_from}-{base_settings.booking_time_to}"
+    )
+    return await run_once(manual_settings, notifier)
+
+
+async def _handle_service_command(
+    text: str,
+    settings: Settings,
+    notifier: TelegramNotifier,
+    next_run_utc: datetime,
+) -> tuple[bool, datetime]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False, next_run_utc
+
+    if normalized.startswith("/help"):
+        notifier.send(_build_service_help())
+        return False, next_run_utc
+
+    if normalized.startswith("/status") or normalized.startswith("/schedule"):
+        notifier.send(_build_status_message(settings, next_run_utc))
+        return False, next_run_utc
+
+    if normalized.startswith("/run") and not normalized.startswith("/runtime"):
+        target = _scheduled_target_date(settings)
+        await _run_manual_booking_for_date(settings, notifier, target)
+        return True, next_run_utc
+
+    if normalized.startswith("/booknext"):
+        target = _scheduled_target_date(settings)
+        await _run_manual_booking_for_date(settings, notifier, target)
+        return True, next_run_utc
+
+    if normalized.startswith("/book"):
+        target = _parse_manual_book_date(normalized, settings)
+        if target is None:
+            notifier.send(
+                "[workplace-booking] Invalid /book command.\n"
+                f"Use /book {datetime.now().strftime(settings.booking_date_format)} or /book +7"
+            )
+            return False, next_run_utc
+        await _run_manual_booking_for_date(settings, notifier, target)
+        return True, next_run_utc
+
+    if normalized.startswith("/ping"):
+        notifier.send("[workplace-booking] pong")
+        return False, next_run_utc
+
+    return False, next_run_utc
+
+
+async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
+    next_run_utc = _next_scheduled_run_utc(settings)
+    LOGGER.info(
+        "Running in service mode. Next scheduled run at %s UTC (%s local).",
+        next_run_utc.isoformat(),
+        _format_local_dt(next_run_utc, settings.schedule_local_utc_offset),
+    )
+    if notifier.enabled:
+        notifier.send(
+            "[workplace-booking] Service mode started\n"
+            f"Next scheduled run: {_format_local_dt(next_run_utc, settings.schedule_local_utc_offset)}\n"
+            f"Scheduled target date (+7): {_scheduled_target_date_for_run(settings, next_run_utc).strftime(settings.booking_date_format)}\n"
+            "Send /help for commands."
+        )
+    else:
+        LOGGER.warning("Service mode is running without Telegram notifications/commands.")
+
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= next_run_utc:
+            target = _scheduled_target_date(settings, now_utc=now_utc)
+            scheduled_settings = _settings_for_single_date(settings, target)
+            notifier.send(
+                "[workplace-booking] Scheduled run started\n"
+                f"Target date: {target.strftime(settings.booking_date_format)}\n"
+                f"Seat: {settings.target_seat}\n"
+                f"Time: {settings.booking_time_from}-{settings.booking_time_to}"
+            )
+            await run_once(scheduled_settings, notifier)
+            next_run_utc = _next_scheduled_run_utc(
+                settings,
+                now_utc=datetime.now(timezone.utc) + timedelta(seconds=1),
+            )
+            continue
+
+        if notifier.enabled:
+            seconds_until_schedule = max(0.0, (next_run_utc - now_utc).total_seconds())
+            poll_timeout = min(
+                settings.telegram_command_poll_timeout_sec,
+                max(1, int(seconds_until_schedule)),
+            )
+            try:
+                messages = await asyncio.to_thread(notifier.poll_text_messages, poll_timeout)
+            except Exception:
+                LOGGER.exception("Telegram command polling failed.")
+                await asyncio.sleep(2)
+                continue
+
+            for message in messages:
+                text = str(message.get("text") or "").strip()
+                handled, next_run_utc = await _handle_service_command(
+                    text=text,
+                    settings=settings,
+                    notifier=notifier,
+                    next_run_utc=next_run_utc,
+                )
+                if handled:
+                    # Keep existing schedule; manual runs should not shift the nightly trigger.
+                    LOGGER.info("Handled Telegram command: %s", text)
+        else:
+            sleep_seconds = min(
+                10,
+                max(1, int((next_run_utc - now_utc).total_seconds())),
+            )
+            await asyncio.sleep(sleep_seconds)
+
+
 def main() -> int:
     load_dotenv()
     settings = Settings.from_env()
@@ -144,6 +395,8 @@ def main() -> int:
 
     if settings.run_mode == "daemon":
         return asyncio.run(run_daemon(settings, notifier))
+    if settings.run_mode == "service":
+        return asyncio.run(run_service(settings, notifier))
     return asyncio.run(run_once(settings, notifier))
 
 

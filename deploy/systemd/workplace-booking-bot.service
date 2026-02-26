@@ -1,0 +1,15 @@
+[Unit]
+Description=Workplace booking bot (service mode with Telegram commands)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/workplace_booking
+ExecStart=/usr/bin/docker compose up --build --no-color workplace-booking
+ExecStop=/usr/bin/docker compose stop workplace-booking
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

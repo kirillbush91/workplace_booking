@@ -100,6 +100,36 @@ class TelegramNotifier:
         )
         return None
 
+    def poll_text_messages(self, timeout_sec: int = 10) -> list[dict[str, object]]:
+        if not self.enabled:
+            return []
+        timeout_sec = max(0, int(timeout_sec))
+        self._prime_update_offset()
+        updates = self._get_updates(timeout=timeout_sec)
+        out: list[dict[str, object]] = []
+        for update in updates:
+            message = update.get("message") or update.get("edited_message")
+            if not isinstance(message, dict):
+                continue
+            if not self._is_target_chat(message):
+                continue
+            text = message.get("text")
+            if not isinstance(text, str):
+                continue
+            out.append(
+                {
+                    "text": text.strip(),
+                    "message_id": message.get("message_id"),
+                    "date": message.get("date"),
+                    "from_id": (
+                        message.get("from", {}).get("id")
+                        if isinstance(message.get("from"), dict)
+                        else None
+                    ),
+                }
+            )
+        return out
+
     def send_document(self, path: Path, caption: str | None = None) -> bool:
         if not self.enabled:
             LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")

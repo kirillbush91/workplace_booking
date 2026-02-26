@@ -168,6 +168,9 @@ class Settings:
 
     run_mode: str
     run_interval_minutes: int
+    schedule_time_local: str
+    schedule_local_utc_offset: str
+    telegram_command_poll_timeout_sec: int
 
     storage_state_path: Path
     screenshot_dir: Path
@@ -179,8 +182,8 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         run_mode = _env_optional("RUN_MODE") or "once"
-        if run_mode not in {"once", "daemon"}:
-            raise ValueError("RUN_MODE must be one of: once, daemon")
+        if run_mode not in {"once", "daemon", "service"}:
+            raise ValueError("RUN_MODE must be one of: once, daemon, service")
 
         storage_state_path = Path(
             _env_optional("STORAGE_STATE_PATH") or ".state/storage_state.json"
@@ -322,6 +325,16 @@ class Settings:
             retry_delay_sec=_env_int("RETRY_DELAY_SEC", 30, min_value=0),
             run_mode=run_mode,
             run_interval_minutes=_env_int("RUN_INTERVAL_MINUTES", 30, min_value=1),
+            schedule_time_local=_env_optional("SCHEDULE_TIME_LOCAL") or "00:01",
+            schedule_local_utc_offset=(
+                _env_optional("SCHEDULE_LOCAL_UTC_OFFSET")
+                or (_env_optional("BOOKING_LOCAL_UTC_OFFSET") or "+03:00")
+            ),
+            telegram_command_poll_timeout_sec=_env_int(
+                "TELEGRAM_COMMAND_POLL_TIMEOUT_SEC",
+                12,
+                min_value=1,
+            ),
             storage_state_path=storage_state_path,
             screenshot_dir=screenshot_dir,
             telegram_bot_token=_env_optional("TELEGRAM_BOT_TOKEN"),

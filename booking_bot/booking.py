@@ -479,9 +479,10 @@ class BookingBot:
                     )
                     try:
                         await self._submit_booking_via_api(page, target_date=target)
-                        screenshot = await self._capture_screenshot(
+                        screenshot = await self._capture_success_screenshot(
                             page,
                             f"success_api_{target.strftime('%Y%m%d')}",
+                            target_date=target,
                         )
                         result = DayBookingResult(
                             date=date_label,
@@ -518,9 +519,10 @@ class BookingBot:
                 await self._select_seat(page)
                 await self._submit_booking(page)
                 await self._wait_for_success(page)
-                screenshot = await self._capture_screenshot(
+                screenshot = await self._capture_success_screenshot(
                     page,
                     f"success_{target.strftime('%Y%m%d')}",
+                    target_date=target,
                 )
                 await self._close_success_modal_if_present(page)
                 result = DayBookingResult(
@@ -784,6 +786,7 @@ class BookingBot:
                 f"Could not determine marker date window for {target_iso}. "
                 "Map marker requests were not captured."
             )
+        self._assert_booking_window_matches_settings(window, target_date)
 
         table_id = await self._resolve_target_table_id_for_date(
             page=page,
@@ -853,6 +856,7 @@ class BookingBot:
             room_type=(base_event.room_type if base_event else None),
         )
         if explicit_window is not None:
+            self._assert_booking_window_matches_settings(explicit_window, target_date)
             return explicit_window
 
         if matching_event and matching_event.date_from and matching_event.date_to:
@@ -940,6 +944,21 @@ class BookingBot:
             utc_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             utc_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
+
+    def _assert_booking_window_matches_settings(
+        self,
+        window: BookingWindow,
+        target_date: date,
+    ) -> None:
+        if not self.settings.booking_time_from or not self.settings.booking_time_to:
+            return
+        expected_from, expected_to = self._build_target_utc_window_from_settings(target_date)
+        if window.date_from != expected_from or window.date_to != expected_to:
+            raise RuntimeError(
+                "Booking window validation failed. "
+                f"Expected {expected_from}..{expected_to}, "
+                f"got {window.date_from}..{window.date_to}."
+            )
 
     @staticmethod
     def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -2114,6 +2133,149 @@ class BookingBot:
     async def _pause(self, page: Page) -> None:
         if self.settings.ui_pause_ms > 0:
             await page.wait_for_timeout(self.settings.ui_pause_ms)
+
+    async def _capture_success_screenshot(
+        self,
+        page: Page,
+        prefix: str,
+        target_date: date | None = None,
+    ) -> Path:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = self.settings.screenshot_dir / f"{prefix}_{timestamp}.png"
+
+        if not page.is_closed():
+            focused = await self._capture_focused_ui_screenshot(page, screenshot_path)
+            if focused:
+                return screenshot_path
+
+        if target_date is not None and not page.is_closed():
+            bookings_shot = await self._capture_bookings_card_screenshot(
+                page=page,
+                target_date=target_date,
+                screenshot_path=screenshot_path,
+            )
+            if bookings_shot:
+                return screenshot_path
+
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        return screenshot_path
+
+    async def _capture_focused_ui_screenshot(
+        self,
+        page: Page,
+        screenshot_path: Path,
+    ) -> bool:
+        candidates: list[Locator] = []
+        if self.settings.success_selector:
+            candidates.append(page.locator(self.settings.success_selector).first)
+        if self.settings.success_close_selector:
+            candidates.append(
+                page.locator(f'div:has({self.settings.success_close_selector})').first
+            )
+
+        selector_candidates = [
+            '[role="dialog"]',
+            'div:has(button:has-text("Закрыть"))',
+            'div:has(button:has-text("Забронировать"))',
+            'div:has-text("Бронирование создано")',
+            'div:has-text("17")',
+        ]
+        for selector in selector_candidates:
+            try:
+                candidates.append(page.locator(selector).first)
+            except Exception:
+                continue
+
+        for locator in candidates:
+            try:
+                await locator.wait_for(state="visible", timeout=800)
+                box = await locator.bounding_box()
+                if not box:
+                    continue
+                if box["width"] < 220 or box["height"] < 120:
+                    continue
+                await locator.screenshot(path=str(screenshot_path))
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _capture_bookings_card_screenshot(
+        self,
+        page: Page,
+        target_date: date,
+        screenshot_path: Path,
+    ) -> bool:
+        tmp_page: Page | None = None
+        try:
+            tmp_page = await page.context.new_page()
+            tmp_page.set_default_timeout(min(self.settings.default_timeout_ms, 20_000))
+            bookings_url = self._build_api_url(page, "/bookings")
+            await tmp_page.goto(bookings_url, wait_until="domcontentloaded")
+            try:
+                await tmp_page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
+            date_text_variants = [
+                target_date.strftime("%d.%m.%Y"),
+                str(target_date.day),
+            ]
+            time_from = (self.settings.booking_time_from or "").strip()
+            time_to = (self.settings.booking_time_to or "").strip()
+            search_texts = [
+                txt for txt in [self.settings.target_seat, time_from, time_to] if txt
+            ]
+            search_texts.extend(date_text_variants)
+
+            selectors = [
+                "article",
+                '[role="listitem"]',
+                '[class*="booking"]',
+                "main",
+            ]
+            for selector in selectors:
+                locator = tmp_page.locator(selector)
+                count = min(await locator.count(), 20)
+                for idx in range(count):
+                    item = locator.nth(idx)
+                    try:
+                        await item.wait_for(state="visible", timeout=500)
+                        text = " ".join((await item.inner_text()).split())
+                    except Exception:
+                        continue
+                    if not text:
+                        continue
+                    if self.settings.target_seat not in text:
+                        continue
+                    if time_from and time_from not in text:
+                        continue
+                    if time_to and time_to not in text:
+                        continue
+                    if not any(v in text for v in date_text_variants):
+                        continue
+                    box = await item.bounding_box()
+                    if box and box["width"] >= 220 and box["height"] >= 120:
+                        await item.screenshot(path=str(screenshot_path))
+                        return True
+            # Fallback: capture bookings page viewport instead of map zoom-out.
+            main_locator = tmp_page.locator("main").first
+            try:
+                await main_locator.wait_for(state="visible", timeout=2_000)
+                await main_locator.screenshot(path=str(screenshot_path))
+                return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            LOGGER.debug("Could not capture bookings card screenshot.", exc_info=True)
+            return False
+        finally:
+            if tmp_page is not None:
+                try:
+                    await tmp_page.close()
+                except Exception:
+                    pass
 
     async def _capture_screenshot(self, page: Page, prefix: str) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
