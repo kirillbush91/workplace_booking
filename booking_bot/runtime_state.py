@@ -5,7 +5,13 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import socket
 from typing import Any
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 def utc_now() -> datetime:
@@ -96,6 +102,7 @@ class RuntimeStateStore:
         self.scheduler_state_path = self.state_dir / "scheduler_state.json"
         self.run_history_path = self.state_dir / "run_history.jsonl"
         self.run_lock_path = self.state_dir / "run.lock"
+        self._run_lock_handle = None
 
     def load_scheduler_state(self) -> SchedulerState:
         if not self.scheduler_state_path.exists():
@@ -150,10 +157,51 @@ class RuntimeStateStore:
         return items[-1]
 
     def acquire_run_lock(self, run_id: str, stale_after_sec: int) -> None:
+        if os.name != "nt":
+            self._acquire_posix_run_lock(run_id)
+            return
+        self._acquire_legacy_run_lock(run_id, stale_after_sec)
+
+    def _acquire_posix_run_lock(self, run_id: str) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "run_id": run_id,
             "acquired_at_utc": utc_now().isoformat(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+        }
+        handle = self.run_lock_path.open("a+", encoding="utf-8", newline="\n")
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                info = self._read_lock_info()
+                raise RunLockError(
+                    "Another booking/preflight run is already in progress. "
+                    f"Lock info: {info or '<unknown>'}"
+                ) from None
+
+            handle.seek(0)
+            handle.truncate()
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            self._run_lock_handle = handle
+            return
+        except Exception:
+            try:
+                handle.close()
+            except Exception:
+                pass
+            raise
+
+    def _acquire_legacy_run_lock(self, run_id: str, stale_after_sec: int) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "run_id": run_id,
+            "acquired_at_utc": utc_now().isoformat(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
         }
         attempt = 0
         while True:
@@ -185,6 +233,24 @@ class RuntimeStateStore:
                     raise RunLockError("Could not acquire run lock after stale cleanup.") from None
 
     def release_run_lock(self, run_id: str) -> None:
+        if self._run_lock_handle is not None:
+            try:
+                self._run_lock_handle.seek(0)
+                try:
+                    fcntl.flock(self._run_lock_handle.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                self._run_lock_handle.close()
+            finally:
+                self._run_lock_handle = None
+            try:
+                self.run_lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+            return
+
         if not self.run_lock_path.exists():
             return
         info = self._read_lock_info()
@@ -198,9 +264,15 @@ class RuntimeStateStore:
     def _clear_stale_lock(self, stale_after_sec: int) -> bool:
         if not self.run_lock_path.exists():
             return True
+        info = self._read_lock_info()
+        if info and self._lock_owner_is_definitely_dead(info):
+            try:
+                self.run_lock_path.unlink()
+            except FileNotFoundError:
+                return True
+            return True
         if stale_after_sec <= 0:
             return False
-        info = self._read_lock_info()
         acquired_at = None
         if info:
             raw = info.get("acquired_at_utc")
@@ -236,9 +308,28 @@ class RuntimeStateStore:
             return None
         return raw
 
+    def _lock_owner_is_definitely_dead(self, info: dict[str, Any]) -> bool:
+        hostname = str(info.get("hostname") or "").strip()
+        pid = info.get("pid")
+        if hostname and hostname != socket.gethostname():
+            return False
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        return not _pid_exists(pid)
+
 
 def _as_optional_str(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -47,6 +48,24 @@ class RuntimeStateStoreTests(unittest.TestCase):
             self.assertEqual(history[0].run_id, "run-1")
             self.assertEqual(history[-1].run_id, "run-3")
             self.assertEqual(store.read_last_history().run_id, "run-3")
+
+    def test_run_lock_can_recover_from_dead_pid_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RuntimeStateStore(Path(tmp))
+            store.run_lock_path.write_text(
+                (
+                    '{"run_id":"old","acquired_at_utc":"2026-03-02T10:29:45+00:00",'
+                    f'"hostname":"{socket.gethostname()}","pid":99999999'
+                    "}\n"
+                ),
+                encoding="utf-8",
+            )
+            store.acquire_run_lock("new-run", stale_after_sec=10_000)
+            info = store._read_lock_info()
+            self.assertIsNotNone(info)
+            self.assertEqual(info["run_id"], "new-run")
+            store.release_run_lock("new-run")
+            self.assertFalse(store.run_lock_path.exists())
 
 
 if __name__ == "__main__":
