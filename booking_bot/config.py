@@ -91,6 +91,30 @@ def _env_list(name: str, default: list[str]) -> list[str]:
     return items or list(default)
 
 
+def _env_map(name: str) -> dict[str, str]:
+    value = _env_optional(name)
+    if value is None:
+        return {}
+    out: dict[str, str] = {}
+    for item in value.split("|"):
+        raw = item.strip()
+        if not raw:
+            continue
+        if ":" not in raw:
+            raise ValueError(
+                f"Environment variable {name} must use 'key:value|key:value' format."
+            )
+        key, mapped = raw.split(":", 1)
+        key = key.strip()
+        mapped = mapped.strip()
+        if not key or not mapped:
+            raise ValueError(
+                f"Environment variable {name} contains an empty key/value pair."
+            )
+        out[key] = mapped
+    return out
+
+
 @dataclass(frozen=True)
 class Settings:
     booking_url: str
@@ -98,6 +122,8 @@ class Settings:
     password: str | None
     target_office: str
     target_seat: str
+    preferred_seats: list[str]
+    preferred_seat_table_ids: dict[str, str]
 
     pre_login_click_selectors: list[str]
     pre_login_click_texts: list[str]
@@ -105,6 +131,7 @@ class Settings:
     otp_code_input_selector: str | None
     otp_code_value: str | None
     otp_wait_timeout_ms: int
+    otp_reminder_interval_sec: int
 
     office_choose_selector: str | None
     office_open_selector: str | None
@@ -170,7 +197,11 @@ class Settings:
     run_interval_minutes: int
     schedule_time_local: str
     schedule_local_utc_offset: str
+    schedule_catchup_window_minutes: int
+    auth_preflight_enabled: bool
+    auth_preflight_time_local: str
     telegram_command_poll_timeout_sec: int
+    run_history_limit: int
 
     storage_state_path: Path
     screenshot_dir: Path
@@ -191,6 +222,12 @@ class Settings:
         screenshot_dir = Path(_env_optional("SCREENSHOT_DIR") or ".state/screenshots")
         storage_state_path.parent.mkdir(parents=True, exist_ok=True)
         screenshot_dir.mkdir(parents=True, exist_ok=True)
+        target_seat = _env_required("TARGET_SEAT")
+        preferred_seats = _env_list("PREFERRED_SEATS", default=[target_seat])
+        preferred_seat_table_ids = _env_map("PREFERRED_SEAT_TABLE_IDS")
+        target_table_id = _env_optional("TARGET_TABLE_ID")
+        if target_table_id and preferred_seats:
+            preferred_seat_table_ids.setdefault(preferred_seats[0], target_table_id)
 
         return cls(
             booking_url=_env_optional("BOOKING_URL")
@@ -198,7 +235,9 @@ class Settings:
             username=_env_optional("USERNAME"),
             password=_env_optional("PASSWORD"),
             target_office=_env_required("TARGET_OFFICE"),
-            target_seat=_env_required("TARGET_SEAT"),
+            target_seat=target_seat,
+            preferred_seats=preferred_seats,
+            preferred_seat_table_ids=preferred_seat_table_ids,
             pre_login_click_selectors=_env_list("PRE_LOGIN_CLICK_SELECTORS", default=[]),
             pre_login_click_texts=_env_list(
                 "PRE_LOGIN_CLICK_TEXTS",
@@ -215,6 +254,11 @@ class Settings:
                 "OTP_WAIT_TIMEOUT_MS",
                 120_000,
                 min_value=1_000,
+            ),
+            otp_reminder_interval_sec=_env_int(
+                "OTP_REMINDER_INTERVAL_SEC",
+                3_600,
+                min_value=1,
             ),
             office_choose_selector=_env_optional("OFFICE_CHOOSE_SELECTOR"),
             office_open_selector=_env_optional("OFFICE_OPEN_SELECTOR"),
@@ -290,7 +334,7 @@ class Settings:
                 _env_optional("BOOKING_LOCAL_UTC_OFFSET") or "+03:00"
             ),
             seat_search_selector=_env_optional("SEAT_SEARCH_SELECTOR"),
-            target_table_id=_env_optional("TARGET_TABLE_ID"),
+            target_table_id=target_table_id,
             booking_use_api_submit_fallback=_env_bool(
                 "BOOKING_USE_API_SUBMIT_FALLBACK",
                 True,
@@ -330,11 +374,21 @@ class Settings:
                 _env_optional("SCHEDULE_LOCAL_UTC_OFFSET")
                 or (_env_optional("BOOKING_LOCAL_UTC_OFFSET") or "+03:00")
             ),
+            schedule_catchup_window_minutes=_env_int(
+                "SCHEDULE_CATCHUP_WINDOW_MINUTES",
+                360,
+                min_value=0,
+            ),
+            auth_preflight_enabled=_env_bool("AUTH_PREFLIGHT_ENABLED", True),
+            auth_preflight_time_local=(
+                _env_optional("AUTH_PREFLIGHT_TIME_LOCAL") or "23:50"
+            ),
             telegram_command_poll_timeout_sec=_env_int(
                 "TELEGRAM_COMMAND_POLL_TIMEOUT_SEC",
                 12,
                 min_value=1,
             ),
+            run_history_limit=_env_int("RUN_HISTORY_LIMIT", 1000, min_value=1),
             storage_state_path=storage_state_path,
             screenshot_dir=screenshot_dir,
             telegram_bot_token=_env_optional("TELEGRAM_BOT_TOKEN"),

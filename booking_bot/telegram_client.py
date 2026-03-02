@@ -13,11 +13,21 @@ LOGGER = logging.getLogger(__name__)
 OTP_REMINDER_INTERVAL_SEC = 60 * 60
 
 
+class OtpWaitCancelledError(RuntimeError):
+    pass
+
+
 class TelegramNotifier:
-    def __init__(self, bot_token: str | None, chat_id: str | None) -> None:
+    def __init__(
+        self,
+        bot_token: str | None,
+        chat_id: str | None,
+        otp_reminder_interval_sec: int = OTP_REMINDER_INTERVAL_SEC,
+    ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self._update_offset: int | None = None
+        self.otp_reminder_interval_sec = max(1, int(otp_reminder_interval_sec))
 
     @property
     def enabled(self) -> bool:
@@ -84,7 +94,13 @@ class TelegramNotifier:
             },
         )
 
-    def wait_for_otp_code(self, timeout_sec: int, poll_timeout_sec: int = 25) -> str | None:
+    def wait_for_otp_code(
+        self,
+        timeout_sec: int,
+        poll_timeout_sec: int = 25,
+        *,
+        context_message: str | None = None,
+    ) -> str | None:
         if not self.enabled:
             LOGGER.warning(
                 "OTP requested via Telegram, but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID are missing."
@@ -95,25 +111,33 @@ class TelegramNotifier:
         poll_timeout_sec = max(1, int(poll_timeout_sec))
         self._prime_update_offset()
 
-        self.send(
+        message = (
             "[workplace-booking] OTP code required.\n"
-            "Reply in this chat with 6 digits in one message."
+            "Reply in this chat with 6 digits in one message.\n"
+            "Send /cancelotp to cancel the current run."
         )
+        if context_message:
+            message = f"{message}\n{context_message}"
+        self.send(message)
 
         deadline = time.monotonic() + timeout_sec
-        next_reminder_at = time.monotonic() + OTP_REMINDER_INTERVAL_SEC
+        next_reminder_at = time.monotonic() + self.otp_reminder_interval_sec
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_reminder_at:
                 remaining_sec = max(0, int(deadline - now))
                 remaining_min = max(1, remaining_sec // 60) if remaining_sec else 0
-                self.send(
+                reminder = (
                     "[workplace-booking] OTP code is still required.\n"
                     "Reply in this chat with 6 digits to continue the booking run.\n"
+                    "Send /cancelotp to cancel the current run.\n"
                     f"Remaining wait time: ~{remaining_min} min."
                 )
+                if context_message:
+                    reminder = f"{reminder}\n{context_message}"
+                self.send(reminder)
                 while next_reminder_at <= now:
-                    next_reminder_at += OTP_REMINDER_INTERVAL_SEC
+                    next_reminder_at += self.otp_reminder_interval_sec
 
             remaining = max(1, int(deadline - time.monotonic()))
             timeout = min(poll_timeout_sec, remaining)
@@ -135,6 +159,9 @@ class TelegramNotifier:
                 text = message.get("text")
                 if not isinstance(text, str):
                     continue
+                if text.strip().lower() == "/cancelotp":
+                    self.send("[workplace-booking] OTP wait cancelled. Current run will stop.")
+                    raise OtpWaitCancelledError("OTP wait cancelled from Telegram.")
                 code = self._extract_six_digit_code(text)
                 if code:
                     self.send("[workplace-booking] OTP code received. Continuing login.")

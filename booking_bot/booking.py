@@ -21,7 +21,7 @@ from playwright.async_api import (
 )
 
 from .config import Settings
-from .telegram_client import TelegramNotifier
+from .telegram_client import OtpWaitCancelledError, TelegramNotifier
 
 
 LOGGER = logging.getLogger(__name__)
@@ -50,6 +50,10 @@ class DaySkipError(RuntimeError):
     pass
 
 
+class SeatAmbiguousError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class DayBookingResult:
     date: str
@@ -57,6 +61,8 @@ class DayBookingResult:
     message: str
     attempt: int
     screenshot_path: Path | None
+    chosen_seat: str | None = None
+    seat_attempt_order: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,20 @@ class BookingResult:
     skipped_dates: list[str]
     failed_dates: list[str]
     day_results: list[DayBookingResult]
+
+
+@dataclass(frozen=True)
+class PreflightResult:
+    started_at: datetime
+    finished_at: datetime
+    session_valid: bool
+    login_required: bool
+    otp_likely: bool
+    office_map_available: bool
+    storage_state_present: bool
+    storage_state_age_sec: int | None
+    current_url: str
+    message: str
 
 
 @dataclass(frozen=True)
@@ -101,8 +121,19 @@ class BookingBot:
         self.notifier = notifier
         self._marker_requests: list[MarkerRequestEvent] = []
         self._resolved_target_table_id: str | None = None
+        self._resolved_target_table_ids: dict[str, str] = {}
         self._api_authorization_header: str | None = None
         self._storage_state_saved_at_least_once = False
+        self._otp_requested = False
+        self._otp_received = False
+
+    @property
+    def otp_requested(self) -> bool:
+        return self._otp_requested
+
+    @property
+    def otp_received(self) -> bool:
+        return self._otp_received
 
     async def book(self) -> BookingResult:
         started_at = datetime.now(timezone.utc)
@@ -178,7 +209,7 @@ class BookingBot:
                     started_at=started_at,
                     finished_at=finished_at,
                     office=self.settings.target_office,
-                    seat=self.settings.target_seat,
+                    seat=" -> ".join(self._seat_attempt_order()),
                     screenshot_path=screenshot,
                     booked_dates=booked_dates,
                     skipped_dates=skipped_dates,
@@ -219,6 +250,119 @@ class BookingBot:
                         LOGGER.debug("Browser was already closed.")
                     else:
                         LOGGER.exception("Failed to close browser cleanly.")
+
+    async def preflight(self) -> PreflightResult:
+        started_at = datetime.now(timezone.utc)
+        browser: Browser | None = None
+        context: BrowserContext | None = None
+        page: Page | None = None
+
+        storage_state_present = self.settings.storage_state_path.exists()
+        storage_state_age_sec: int | None = None
+        if storage_state_present:
+            try:
+                mtime = self.settings.storage_state_path.stat().st_mtime
+                storage_state_age_sec = max(
+                    0,
+                    int(started_at.timestamp() - mtime),
+                )
+            except Exception:
+                storage_state_age_sec = None
+
+        login_required = False
+        otp_likely = False
+        office_map_available = False
+        current_url = self.settings.booking_url
+        message = "Preflight did not complete."
+
+        try:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=self.settings.headless)
+                context = await self._new_context(browser)
+                page = await context.new_page()
+                self._attach_page_trackers(page)
+                page.set_default_timeout(self.settings.default_timeout_ms)
+
+                LOGGER.info("Running auth preflight for %s", self.settings.booking_url)
+                await page.goto(self.settings.booking_url, wait_until="domcontentloaded")
+                await self._pause(page)
+
+                if self.settings.page_ready_selector:
+                    try:
+                        await page.locator(self.settings.page_ready_selector).first.wait_for(
+                            state="visible", timeout=min(self.settings.default_timeout_ms, 5_000)
+                        )
+                    except Exception:
+                        pass
+
+                await self._perform_pre_login_actions(page)
+                current_url = page.url
+
+                username_entry = await self._first_visible_selector(
+                    page=page,
+                    selectors=self.settings.login_username_selectors,
+                    total_timeout_ms=2_500,
+                )
+                password_entry = await self._first_visible_selector(
+                    page=page,
+                    selectors=self.settings.login_password_selectors,
+                    total_timeout_ms=2_500,
+                )
+                login_required = username_entry is not None or password_entry is not None
+
+                if not login_required and self.settings.otp_code_input_selector:
+                    otp_input = page.locator(self.settings.otp_code_input_selector).first
+                    try:
+                        await otp_input.wait_for(state="visible", timeout=2_000)
+                        otp_likely = await self._otp_screen_hints_present(page)
+                    except Exception:
+                        otp_likely = False
+
+                if not login_required and not otp_likely:
+                    try:
+                        await self._select_office(page)
+                        office_map_available = True
+                        current_url = page.url
+                    except Exception:
+                        office_map_available = False
+                        current_url = page.url
+
+                session_valid = office_map_available and not login_required and not otp_likely
+                if session_valid:
+                    message = "Saved session is valid and office map is reachable."
+                elif login_required:
+                    message = "Login form is visible. Saved session is no longer valid."
+                elif otp_likely:
+                    message = "OTP screen is visible or likely. Manual OTP may be required soon."
+                elif not office_map_available:
+                    message = "Office map could not be opened during preflight."
+                else:
+                    message = "Preflight finished with warnings."
+
+                finished_at = datetime.now(timezone.utc)
+                return PreflightResult(
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    session_valid=session_valid,
+                    login_required=login_required,
+                    otp_likely=otp_likely,
+                    office_map_available=office_map_available,
+                    storage_state_present=storage_state_present,
+                    storage_state_age_sec=storage_state_age_sec,
+                    current_url=current_url,
+                    message=message,
+                )
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     async def _persist_storage_state_safe(
         self,
@@ -359,6 +503,7 @@ class BookingBot:
             return
 
         LOGGER.info("OTP input detected.")
+        self._otp_requested = True
         if self.settings.otp_code_value:
             # Some OTP pages render one input, some render N inputs.
             # Focusing the first input and typing raw code works for both patterns.
@@ -366,15 +511,21 @@ class BookingBot:
             await otp_input.click()
             await page.keyboard.press("Control+A")
             await page.keyboard.type(raw_code)
+            self._otp_received = True
         elif self.notifier and self.notifier.enabled:
-            code = await asyncio.to_thread(
-                self.notifier.wait_for_otp_code,
-                max(1, self.settings.otp_wait_timeout_ms // 1000),
-            )
+            try:
+                code = await asyncio.to_thread(
+                    self.notifier.wait_for_otp_code,
+                    max(1, self.settings.otp_wait_timeout_ms // 1000),
+                    context_message=self._otp_context_message(),
+                )
+            except OtpWaitCancelledError as exc:
+                raise RuntimeError("OTP wait cancelled from Telegram.") from exc
             if code:
                 await otp_input.click()
                 await page.keyboard.press("Control+A")
                 await page.keyboard.type(code)
+                self._otp_received = True
             else:
                 LOGGER.warning(
                     "OTP code was not received from Telegram in time. "
@@ -503,6 +654,7 @@ class BookingBot:
     async def _book_single_date(self, page: Page, target: date) -> DayBookingResult:
         date_label = target.strftime(self.settings.booking_date_format)
         max_attempts = self.settings.booking_per_date_attempts
+        seat_order = tuple(self._seat_attempt_order())
 
         if self.settings.booking_skip_weekends and target.weekday() >= 5:
             result = DayBookingResult(
@@ -514,108 +666,107 @@ class BookingBot:
                 ),
                 attempt=1,
                 screenshot_path=None,
+                seat_attempt_order=seat_order,
             )
             await self._notify_day_result(result)
             return result
 
         for attempt in range(1, max_attempts + 1):
             LOGGER.info("Processing date %s (attempt %s/%s).", date_label, attempt, max_attempts)
-            try:
-                if self.settings.booking_use_api_submit_fallback:
-                    await self._configure_booking_parameters(
-                        page,
+            unavailable_messages: list[str] = []
+            technical_messages: list[str] = []
+            for seat_index, seat in enumerate(seat_order):
+                table_id_override = self._table_id_for_seat(seat)
+                try:
+                    screenshot, flow_message = await self._book_single_seat_for_date(
+                        page=page,
                         target_date=target,
-                        apply_optional_ui=False,
+                        seat=seat,
+                        table_id_override=table_id_override,
                     )
-                    try:
-                        await self._submit_booking_via_api(page, target_date=target)
-                        screenshot = await self._capture_success_screenshot(
-                            page,
-                            f"success_api_{target.strftime('%Y%m%d')}",
-                            target_date=target,
-                        )
-                        result = DayBookingResult(
-                            date=date_label,
-                            status="booked",
-                            message="Booking created via API.",
-                            attempt=attempt,
-                            screenshot_path=screenshot,
-                        )
-                        await self._notify_day_result(result)
-                        return result
-                    except DaySkipError:
-                        raise
-                    except Exception as api_exc:
-                        if page.is_closed():
-                            raise
-                        if self.settings.target_table_id:
-                            # If exact table UUID is configured, API path is the source of truth.
-                            raise
-                        if "set target_table_id" in str(api_exc).lower():
-                            raise DaySkipError(str(api_exc)) from api_exc
-                        LOGGER.warning(
-                            "API booking path failed for %s: %s: %s. "
-                            "Falling back to UI flow.",
-                            date_label,
-                            api_exc.__class__.__name__,
-                            api_exc,
-                        )
-
-                await self._configure_booking_parameters(
-                    page,
-                    target_date=target,
-                    apply_optional_ui=True,
-                )
-                await self._select_seat(page)
-                await self._submit_booking(page)
-                await self._wait_for_success(page)
-                screenshot = await self._capture_success_screenshot(
-                    page,
-                    f"success_{target.strftime('%Y%m%d')}",
-                    target_date=target,
-                )
-                await self._close_success_modal_if_present(page)
-                result = DayBookingResult(
-                    date=date_label,
-                    status="booked",
-                    message="Booking created via UI.",
-                    attempt=attempt,
-                    screenshot_path=screenshot,
-                )
-                await self._notify_day_result(result)
-                return result
-            except DaySkipError as exc:
-                result = DayBookingResult(
-                    date=date_label,
-                    status="skipped",
-                    message=str(exc),
-                    attempt=attempt,
-                    screenshot_path=None,
-                )
-                await self._notify_day_result(result)
-                await self._recover_after_day_attempt(page)
-                return result
-            except Exception as exc:
-                if page.is_closed():
-                    raise
-                LOGGER.warning(
-                    "Date %s attempt %s failed: %s: %s",
-                    date_label,
-                    attempt,
-                    exc.__class__.__name__,
-                    exc,
-                )
-                await self._recover_after_day_attempt(page)
-                if attempt >= max_attempts:
                     result = DayBookingResult(
                         date=date_label,
-                        status="failed",
-                        message=f"{exc.__class__.__name__}: {exc}",
+                        status="booked",
+                        message=flow_message,
                         attempt=attempt,
-                        screenshot_path=None,
+                        screenshot_path=screenshot,
+                        chosen_seat=seat,
+                        seat_attempt_order=seat_order,
                     )
                     await self._notify_day_result(result)
                     return result
+                except DaySkipError as exc:
+                    text = str(exc)
+                    unavailable_messages.append(text)
+                    if seat_index < len(seat_order) - 1:
+                        fallback_message = (
+                            f"Seat {seat} unavailable for {date_label}, trying seat {seat_order[seat_index + 1]}."
+                        )
+                        LOGGER.info(fallback_message)
+                        if self.notifier and self.notifier.enabled:
+                            await asyncio.to_thread(self.notifier.send, f"[workplace-booking] {fallback_message}")
+                    await self._recover_after_day_attempt(page)
+                    continue
+                except SeatAmbiguousError as exc:
+                    result = DayBookingResult(
+                        date=date_label,
+                        status="failed",
+                        message=str(exc),
+                        attempt=attempt,
+                        screenshot_path=None,
+                        seat_attempt_order=seat_order,
+                    )
+                    await self._notify_day_result(result)
+                    return result
+                except Exception as exc:
+                    if page.is_closed():
+                        raise
+                    LOGGER.warning(
+                        "Date %s attempt %s seat %s failed: %s: %s",
+                        date_label,
+                        attempt,
+                        seat,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+                    technical_messages.append(
+                        f"Seat {seat}: {exc.__class__.__name__}: {exc}"
+                    )
+                    await self._recover_after_day_attempt(page)
+                    continue
+
+            if technical_messages:
+                if attempt >= max_attempts:
+                    summary_parts = list(technical_messages)
+                    if unavailable_messages:
+                        summary_parts.extend(unavailable_messages)
+                    result = DayBookingResult(
+                        date=date_label,
+                        status="failed",
+                        message="; ".join(summary_parts),
+                        attempt=attempt,
+                        screenshot_path=None,
+                        seat_attempt_order=seat_order,
+                    )
+                    await self._notify_day_result(result)
+                    return result
+                LOGGER.info(
+                    "Retrying date %s after technical seat failures: %s",
+                    date_label,
+                    "; ".join(technical_messages),
+                )
+                continue
+
+            result = DayBookingResult(
+                date=date_label,
+                status="skipped",
+                message="; ".join(unavailable_messages) or "All preferred seats were unavailable.",
+                attempt=attempt,
+                screenshot_path=None,
+                seat_attempt_order=seat_order,
+            )
+            await self._notify_day_result(result)
+            return result
         # Defensive fallback.
         return DayBookingResult(
             date=date_label,
@@ -623,14 +774,78 @@ class BookingBot:
             message="Unexpected date processing state.",
             attempt=max_attempts,
             screenshot_path=None,
+            seat_attempt_order=seat_order,
         )
+
+    async def _book_single_seat_for_date(
+        self,
+        page: Page,
+        target_date: date,
+        seat: str,
+        table_id_override: str | None,
+    ) -> tuple[Path, str]:
+        date_label = target_date.strftime(self.settings.booking_date_format)
+        if self.settings.booking_use_api_submit_fallback:
+            await self._configure_booking_parameters(
+                page,
+                target_date=target_date,
+                apply_optional_ui=False,
+            )
+            try:
+                await self._submit_booking_via_api(
+                    page=page,
+                    target_date=target_date,
+                    seat=seat,
+                    table_id_override=table_id_override,
+                )
+                screenshot = await self._capture_success_screenshot(
+                    page,
+                    f"success_api_{target_date.strftime('%Y%m%d')}_{seat}",
+                    target_date=target_date,
+                    target_seat=seat,
+                )
+                return screenshot, f"Booking created via API on seat {seat}."
+            except DaySkipError:
+                raise
+            except SeatAmbiguousError:
+                raise
+            except Exception as api_exc:
+                if page.is_closed():
+                    raise
+                if table_id_override:
+                    raise
+                LOGGER.warning(
+                    "API booking path failed for %s seat %s: %s: %s. Falling back to UI flow.",
+                    date_label,
+                    seat,
+                    api_exc.__class__.__name__,
+                    api_exc,
+                )
+
+        await self._configure_booking_parameters(
+            page,
+            target_date=target_date,
+            apply_optional_ui=True,
+        )
+        await self._select_seat(page, seat)
+        await self._submit_booking(page)
+        await self._wait_for_success(page)
+        screenshot = await self._capture_success_screenshot(
+            page,
+            f"success_{target_date.strftime('%Y%m%d')}_{seat}",
+            target_date=target_date,
+            target_seat=seat,
+        )
+        await self._close_success_modal_if_present(page)
+        return screenshot, f"Booking created via UI on seat {seat}."
 
     async def _notify_day_result(self, result: DayBookingResult) -> None:
         LOGGER.info(
-            "Day result: date=%s status=%s attempt=%s message=%s",
+            "Day result: date=%s status=%s attempt=%s seat=%s message=%s",
             result.date,
             result.status,
             result.attempt,
+            result.chosen_seat or "-",
             result.message,
         )
         if not (self.notifier and self.notifier.enabled):
@@ -641,6 +856,8 @@ class BookingBot:
             f"{icon} Date: {result.date}\n"
             f"Status: {result.status}\n"
             f"Attempt: {result.attempt}\n"
+            f"Seat order: {' -> '.join(result.seat_attempt_order) if result.seat_attempt_order else ' -> '.join(self._seat_attempt_order())}\n"
+            f"Chosen seat: {result.chosen_seat or 'n/a'}\n"
             f"Message: {result.message}"
         )
         await asyncio.to_thread(self.notifier.send, message)
@@ -780,19 +997,19 @@ class BookingBot:
                 step_name="booking params close",
             )
 
-    async def _select_seat(self, page: Page) -> None:
-        LOGGER.info("Selecting seat: %s", self.settings.target_seat)
+    async def _select_seat(self, page: Page, seat: str) -> None:
+        LOGGER.info("Selecting seat: %s", seat)
         if self.settings.seat_search_selector:
             search_input = page.locator(self.settings.seat_search_selector).first
             await search_input.wait_for(
                 state="visible", timeout=self.settings.default_timeout_ms
             )
-            await search_input.fill(self.settings.target_seat)
+            await search_input.fill(seat)
             await search_input.press("Enter")
             await self._pause(page)
 
         if self.settings.seat_selector_template:
-            selector = self._format_selector(self.settings.seat_selector_template)
+            selector = self._format_selector(self.settings.seat_selector_template, seat=seat)
             await self._click_selector(page, selector)
             return
 
@@ -804,7 +1021,7 @@ class BookingBot:
             await self._click_seat_canvas(page)
             return
 
-        await self._click_text(page, self.settings.target_seat)
+        await self._click_text(page, seat)
 
     async def _submit_booking(self, page: Page) -> None:
         LOGGER.info("Submitting booking.")
@@ -828,7 +1045,13 @@ class BookingBot:
             "Likely no available slot."
         ) from last_exception
 
-    async def _submit_booking_via_api(self, page: Page, target_date: date) -> None:
+    async def _submit_booking_via_api(
+        self,
+        page: Page,
+        target_date: date,
+        seat: str,
+        table_id_override: str | None = None,
+    ) -> None:
         target_iso = target_date.strftime("%Y-%m-%d")
         window = self._resolve_booking_window_for_date(target_date)
         if window is None:
@@ -842,6 +1065,8 @@ class BookingBot:
             page=page,
             target_date=target_date,
             window=window,
+            seat=seat,
+            table_id_override=table_id_override,
         )
         payload = {
             "table": table_id,
@@ -866,6 +1091,7 @@ class BookingBot:
         if status in {200, 201}:
             LOGGER.info("API booking created successfully (status=%s).", status)
             self._resolved_target_table_id = table_id
+            self._resolved_target_table_ids[str(seat).strip()] = table_id
             return
 
         message = self._extract_api_error_message(body_text)
@@ -883,7 +1109,7 @@ class BookingBot:
         )
         if status in {400, 404, 409, 422} and any(hint in normalized for hint in skip_hints):
             raise DaySkipError(
-                f"Seat {self.settings.target_seat} is unavailable for {target_iso}: "
+                f"Seat {seat} is unavailable for {target_iso}: "
                 f"{message or f'HTTP {status}'}"
             )
 
@@ -1043,14 +1269,22 @@ class BookingBot:
         page: Page,
         target_date: date,
         window: BookingWindow,
+        seat: str,
+        table_id_override: str | None = None,
     ) -> str:
-        if self.settings.target_table_id:
-            return self.settings.target_table_id
-        if self._resolved_target_table_id:
+        seat_value = str(seat).strip()
+        if table_id_override:
+            return table_id_override
+        mapped = self._table_id_for_seat(seat_value)
+        if mapped:
+            return mapped
+        if seat_value in self._resolved_target_table_ids:
+            return self._resolved_target_table_ids[seat_value]
+        if seat_value == self.settings.target_seat and self._resolved_target_table_id:
             return self._resolved_target_table_id
 
         markers = await self._fetch_table_markers(page=page, window=window)
-        target_seat = str(self.settings.target_seat).strip()
+        target_seat = seat_value
         candidates: list[dict] = []
         for marker in markers:
             title = str(marker.get("table_title", "")).strip()
@@ -1088,7 +1322,9 @@ class BookingBot:
 
         if len(available) == 1:
             resolved = str(available[0].get("table_id"))
-            self._resolved_target_table_id = resolved
+            self._resolved_target_table_ids[target_seat] = resolved
+            if target_seat == self.settings.target_seat:
+                self._resolved_target_table_id = resolved
             return resolved
 
         if window.room_type:
@@ -1099,15 +1335,18 @@ class BookingBot:
             ]
             if len(same_room_type) == 1:
                 resolved = str(same_room_type[0].get("table_id"))
-                self._resolved_target_table_id = resolved
+                self._resolved_target_table_ids[target_seat] = resolved
+                if target_seat == self.settings.target_seat:
+                    self._resolved_target_table_id = resolved
                 return resolved
 
         unique_ids = sorted(
             {str(marker.get("table_id", "")).strip() for marker in available if marker.get("table_id")}
         )
-        raise RuntimeError(
+        raise SeatAmbiguousError(
             "Seat number is ambiguous across multiple desks. "
-            f"Set TARGET_TABLE_ID. Candidates for seat {target_seat}: {', '.join(unique_ids[:8])}"
+            f"Set PREFERRED_SEAT_TABLE_IDS for seat {target_seat}. "
+            f"Candidates: {', '.join(unique_ids[:8])}"
         )
 
     async def _fetch_table_markers(self, page: Page, window: BookingWindow) -> list[dict]:
@@ -2114,12 +2353,51 @@ class BookingBot:
             await page.wait_for_timeout(150)
         return None
 
-    def _format_selector(self, template: str) -> str:
+    def _format_selector(self, template: str, seat: str | None = None) -> str:
+        seat_value = (seat or self.settings.target_seat).strip()
         return template.format(
             office=self.settings.target_office,
             office_name=self.settings.target_office,
-            seat=self.settings.target_seat,
-            seat_name=self.settings.target_seat,
+            seat=seat_value,
+            seat_name=seat_value,
+        )
+
+    def _seat_attempt_order(self) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for seat in self.settings.preferred_seats:
+            value = str(seat).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        if not out:
+            out.append(self.settings.target_seat)
+        return out
+
+    def _table_id_for_seat(self, seat: str) -> str | None:
+        value = self.settings.preferred_seat_table_ids.get(str(seat).strip())
+        if value:
+            return value
+        if str(seat).strip() == self.settings.target_seat and self.settings.target_table_id:
+            return self.settings.target_table_id
+        return None
+
+    def _otp_context_message(self) -> str:
+        seat_order = " -> ".join(self._seat_attempt_order())
+        target_dates = self._resolve_target_dates()
+        if target_dates:
+            label = ", ".join(
+                item.strftime(self.settings.booking_date_format) for item in target_dates[:3]
+            )
+            if len(target_dates) > 3:
+                label = f"{label}, ..."
+        else:
+            label = "n/a"
+        return (
+            f"Target date(s): {label}\n"
+            f"Seat preference: {seat_order}\n"
+            f"Booking window: {self.settings.booking_time_from}-{self.settings.booking_time_to}"
         )
 
     def _resolve_target_dates(self) -> list[date]:
@@ -2189,6 +2467,7 @@ class BookingBot:
         page: Page,
         prefix: str,
         target_date: date | None = None,
+        target_seat: str | None = None,
     ) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         screenshot_path = self.settings.screenshot_dir / f"{prefix}_{timestamp}.png"
@@ -2202,6 +2481,7 @@ class BookingBot:
             bookings_shot = await self._capture_bookings_card_screenshot(
                 page=page,
                 target_date=target_date,
+                target_seat=(target_seat or self.settings.target_seat),
                 screenshot_path=screenshot_path,
             )
             if bookings_shot:
@@ -2254,6 +2534,7 @@ class BookingBot:
         self,
         page: Page,
         target_date: date,
+        target_seat: str,
         screenshot_path: Path,
     ) -> bool:
         tmp_page: Page | None = None
@@ -2291,7 +2572,7 @@ class BookingBot:
                         if not text:
                             continue
                         text_lower = text.lower()
-                        if self.settings.target_seat not in text:
+                        if str(target_seat).strip() not in text:
                             continue
                         # Bookings page may show time in GMT0 instead of local office time.
                         # Date + seat is the primary discriminator. Time is best-effort only.

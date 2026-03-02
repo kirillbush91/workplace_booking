@@ -36,6 +36,8 @@ cp .env.example .env
 
 Fill `.env`:
 - `TARGET_OFFICE`, `TARGET_SEAT` are required.
+- `PREFERRED_SEATS=17|19` enables automatic fallback from seat `17` to seat `19`.
+- `PREFERRED_SEAT_TABLE_IDS=17:...|19:...` pins exact table UUIDs per seat when known.
 - set `USERNAME` and `PASSWORD` for LDAP form auto-fill.
 - add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for alerts.
 - set `OTP_CODE_INPUT_SELECTOR` for OTP screen.  
@@ -141,6 +143,7 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `OTP_CODE_INPUT_SELECTOR`: OTP input (or first digit input) shown after SSO submit.
 - `OTP_CODE_VALUE`: optional static OTP value. Usually keep it empty and reply with code in Telegram.
 - `OTP_WAIT_TIMEOUT_MS`: how long to wait for OTP completion.
+- `OTP_REMINDER_INTERVAL_SEC`: repeat interval for OTP reminders while the bot is waiting.
 - `OFFICE_CHOOSE_SELECTOR`: click direct office action on `/offices` page.
 - `OFFICE_OPEN_SELECTOR`: click this first if office list is behind dropdown/modal.
 - `OFFICE_OPTION_SELECTOR_TEMPLATE`: selector for office option.
@@ -159,6 +162,7 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - `BOOKING_RANGE_DAYS`: date range size from today (default `7`, inclusive).
 - `BOOKING_INCLUDE_TODAY`: include current day in range.
 - `BOOKING_SKIP_WEEKENDS`: optional weekend skip in range mode.
+- `RUN_MODE=service` also applies the same weekend policy to nightly scheduled runs and manual `/book` commands.
 - `BOOKING_PER_DATE_ATTEMPTS`: retries per date before marking it failed.
 - `BOOKING_DATE_APPLY_WAIT_TIMEOUT_MS`: max wait for date state sync after calendar click.
 - `BOOKING_USE_URL_DATE_FALLBACK`: if calendar click does not apply date, reloads `/map` with `date_from/date_to` params.
@@ -173,6 +177,9 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - API booking path validates the outgoing UTC window against configured local time before submit. If the window does not match, the run fails instead of creating a wrong-time booking.
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
 - `TARGET_TABLE_ID`: exact table UUID for seat (recommended; required for deterministic booking when many places share the same visible number, e.g. multiple `17`).
+- `PREFERRED_SEATS`: ordered seat fallback list. Example `17|19` means "try 17 first, then 19".
+- `PREFERRED_SEAT_TABLE_IDS`: exact per-seat UUID mapping used before dynamic marker lookup.
+  If seat `19` is ambiguous and no UUID is configured, the run fails with a clear error asking you to set `PREFERRED_SEAT_TABLE_IDS` for seat `19`.
 - `BOOKING_USE_API_SUBMIT_FALLBACK`: enables API submit via `/api/web/single_booking`.
   If `TARGET_TABLE_ID` is set, bot uses API path as primary and does not rely on fragile seat/button UI clicks.
 - `SEAT_SELECTOR_TEMPLATE`: selector for seat element.
@@ -279,6 +286,8 @@ Messages include:
 - per-day status in range mode (booked/skipped/failed),
 - retry notification before next attempt,
 - OTP request/timeout status when OTP screen is detected,
+- OTP reminder every `OTP_REMINDER_INTERVAL_SEC` seconds until code is received or timeout expires,
+- `/cancelotp` support while the bot is waiting for OTP,
 - attempt number,
 - seat/office,
 - UTC timestamp,
@@ -291,7 +300,48 @@ Messages include:
 - `RUN_MODE=daemon`: infinite loop, runs every `RUN_INTERVAL_MINUTES`.
 - `RUN_MODE=service`: long-running scheduler + Telegram commands.
   Uses `SCHEDULE_TIME_LOCAL` and `SCHEDULE_LOCAL_UTC_OFFSET` for nightly run timing.
-  Telegram commands: `/help`, `/status`, `/run`, `/booknext`, `/book DD.MM.YYYY`, `/book +7`, `/ping`.
+  Additional service settings:
+  - `SCHEDULE_CATCHUP_WINDOW_MINUTES`: if VPS/container was down at `00:01`, the bot can execute the missed run automatically after restart.
+  - `AUTH_PREFLIGHT_ENABLED=true`: run read-only auth/session self-check before the booking window.
+  - `AUTH_PREFLIGHT_TIME_LOCAL=23:50`: preflight time in scheduler local timezone.
+  - `RUN_HISTORY_LIMIT`: number of stored run-history entries in `.state/run_history.jsonl`.
+  Telegram commands:
+  - `/help`
+  - `/menu`
+  - `/status`
+  - `/preflight`
+  - `/last`
+  - `/history`
+  - `/run`
+  - `/booknext`
+  - `/book DD.MM.YYYY`
+  - `/book +7`
+  - `/seat 17`
+  - `/cancelotp`
+  - `/ping`
+
+`/status` shows:
+- current scheduler config,
+- preferred seat order,
+- weekend policy,
+- catch-up policy,
+- OTP wait/reminder policy,
+- next scheduled run and next target date,
+- last completed run,
+- pending catch-up state,
+- 7-line schedule preview.
+
+Nightly behavior:
+- main scheduled run is every day at `SCHEDULE_TIME_LOCAL`,
+- target date is calculated as `local run date + BOOKING_DATE_OFFSET_DAYS`,
+- Saturday/Sunday targets are skipped by policy,
+- if seat `17` is unavailable, bot tries seat `19`,
+- if restart happens after a missed nightly trigger, catch-up runs once inside `SCHEDULE_CATCHUP_WINDOW_MINUTES`.
+
+Runtime state files:
+- `.state/scheduler_state.json`
+- `.state/run_history.jsonl`
+- `.state/run.lock`
 
 ## 6) Docker run
 
