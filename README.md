@@ -43,12 +43,42 @@ Fill `.env`:
 - set `OTP_CODE_INPUT_SELECTOR` for OTP screen.  
   If `OTP_CODE_VALUE` is empty, bot will request OTP code in Telegram and wait for your reply.
 - `.env` is local-only and must not be committed to git (use `.env.example` as template).
+- if you want current secrets/versioned settings in git without exposing plaintext, store `.env.enc` in git and keep the encryption key outside the repo via `scripts/env_vault.py`.
 
 Run once:
 
 ```bash
 python -m booking_bot
 ```
+
+## 1.0) Keep actual variables in git without exposing plaintext
+
+Plaintext `.env` must stay out of git.
+If the repository is public and you still want the current variables versioned, use the built-in vault helper:
+
+```bash
+python scripts/env_vault.py init-key
+python scripts/env_vault.py encrypt
+```
+
+This creates:
+- local plaintext `.env` for runtime,
+- tracked encrypted `.env.enc` for git,
+- local key file outside the repo:
+  - Windows: `%USERPROFILE%\\.workplace_booking_env.key`
+  - Linux/macOS: `~/.workplace_booking_env.key`
+
+To restore `.env` from git on another machine:
+
+```bash
+python scripts/env_vault.py decrypt
+```
+
+Rules:
+- commit `.env.enc`
+- never commit the key file
+- never commit plaintext `.env`
+- if someone gets both `.env.enc` and the key file, they can decrypt the secrets
 
 ## 1.1) Windows setup without admin rights (recommended flow)
 

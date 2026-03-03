@@ -1,5 +1,6 @@
 .state/
 .env
+.workplace_booking_env.key
 .venv/
 __pycache__/
 *.pyc
