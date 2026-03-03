@@ -4,12 +4,13 @@ import asyncio
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 import logging
+import os
 from pathlib import Path
 import re
 import traceback
 import uuid
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from .booking import BookingBot, BookingError, BookingResult, PreflightResult
 from .config import Settings
@@ -74,6 +75,24 @@ def _configure_logging(level: str) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+
+def _load_env_files(shared_path: str | Path = ".env.shared", local_path: str | Path = ".env") -> list[str]:
+    loaded: list[str] = []
+    protected_keys = set(os.environ.keys())
+    for raw_path in (shared_path, local_path):
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        values = dotenv_values(path)
+        for key, value in values.items():
+            if value is None:
+                continue
+            if key in protected_keys:
+                continue
+            os.environ[key] = value
+        loaded.append(str(path))
+    return loaded
 
 
 def _state_store(settings: Settings) -> RuntimeStateStore:
@@ -1544,7 +1563,7 @@ async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
 
 
 def main() -> int:
-    load_dotenv()
+    _load_env_files()
     settings = Settings.from_env()
     _configure_logging(settings.log_level)
 
