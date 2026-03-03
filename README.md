@@ -36,8 +36,8 @@ cp .env.example .env
 
 Fill `.env`:
 - `TARGET_OFFICE`, `TARGET_SEAT` are required.
-- `PREFERRED_SEATS=17|19` enables automatic fallback from seat `17` to seat `19`.
-- `PREFERRED_SEAT_TABLE_IDS=17:...|19:...` pins exact table UUIDs per seat when known.
+- `PREFERRED_SEATS=1|17` enables automatic fallback from seat `1` to seat `17`.
+- `PREFERRED_SEAT_TABLE_IDS=1:...|17:...` pins exact table UUIDs per seat when known.
 - set `USERNAME` and `PASSWORD` for LDAP form auto-fill.
 - add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for alerts.
 - set `OTP_CODE_INPUT_SELECTOR` for OTP screen.  
@@ -177,9 +177,9 @@ Different UI builds can expose different HTML selectors, so most selectors are c
 - API booking path validates the outgoing UTC window against configured local time before submit. If the window does not match, the run fails instead of creating a wrong-time booking.
 - `SEAT_SEARCH_SELECTOR`: optional search field before seat click.
 - `TARGET_TABLE_ID`: exact table UUID for seat (recommended; required for deterministic booking when many places share the same visible number, e.g. multiple `17`).
-- `PREFERRED_SEATS`: ordered seat fallback list. Example `17|19` means "try 17 first, then 19".
+- `PREFERRED_SEATS`: ordered seat fallback list. Example `1|17` means "try seat 1 first, then 17".
 - `PREFERRED_SEAT_TABLE_IDS`: exact per-seat UUID mapping used before dynamic marker lookup.
-  If seat `19` is ambiguous and no UUID is configured, the run fails with a clear error asking you to set `PREFERRED_SEAT_TABLE_IDS` for seat `19`.
+  If a fallback seat is ambiguous and no UUID is configured, the run fails with a clear error asking you to set `PREFERRED_SEAT_TABLE_IDS` for that seat.
 - `BOOKING_USE_API_SUBMIT_FALLBACK`: enables API submit via `/api/web/single_booking`.
   If `TARGET_TABLE_ID` is set, bot uses API path as primary and does not rely on fragile seat/button UI clicks.
 - `SEAT_SELECTOR_TEMPLATE`: selector for seat element.
@@ -247,6 +247,15 @@ Artifacts will be created in `artifacts/behavior_probe_YYYYmmdd_HHMMSS/`:
 - `summary.json` (endpoint counters),
 - `trace.zip` (open via `playwright show-trace trace.zip`),
 - `session.har` (network HAR, unless `--no-har`).
+
+If you only need the exact backend `table_id` for a seat and already know the office/floor:
+
+```bash
+python scripts/seat_id_probe.py --url "https://lemana.simple-office-web.liis.su/"
+```
+
+Then navigate manually in the opened browser to the target hard and seat, click the seat once, and close the browser.
+The script stores raw `/api/web/floor/table_markers` responses in `artifacts/seat_id_probe_YYYYmmdd_HHMMSS/`, which is enough to extract the exact `table_id` and configure `PREFERRED_SEAT_TABLE_IDS` deterministically.
 
 If you cannot run Playwright locally, use browser DevTools helper:
 
