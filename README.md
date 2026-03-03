@@ -109,7 +109,7 @@ python --version
 ### Step 2. Prepare project
 
 ```powershell
-cd "C:\Users\YourUserId\OneDrive - leroymerlin.ru\Documents\workplace_booking"
+cd "C:\Users\YourUser\OneDrive - Company\Documents\workplace_booking"
 python -m venv .venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
