@@ -75,7 +75,6 @@ RUN_MODE=once
 Important:
 - a public GitHub repository cannot hide the contents of a tracked file from people who can read/fork the repo
 - therefore real secrets must stay out of tracked files
-- if you need secrets inside GitHub Actions, use GitHub Actions Secrets, not `.env` in the repo
 
 ## 1.1) Windows setup without admin rights (recommended flow)
 
@@ -465,18 +464,15 @@ sudo systemctl enable --now workplace-booking-bot.service
 sudo systemctl status workplace-booking-bot.service
 ```
 
-## 8) Free cloud deployment (typical pattern)
+## 8) Free cloud deployment
 
-For free tiers, most stable approach is scheduled CI:
-- GitHub Actions scheduled workflow runs `python -m booking_bot` on interval,
-- repository secrets store `.env` values,
-- screenshots can be uploaded as artifacts.
+No GitHub Actions workflow is kept in this public repository.
+Reason:
+- public workflow runs keep historical metadata,
+- screenshots/artifacts are an unnecessary leak surface,
+- the VPS service mode is the primary production path for this project.
 
-Ready workflow:
-- `.github/workflows/booking.yml`
-
-Some PaaS free tiers can also run cron jobs, but limits/availability change often.
-For booking-critical flows, VPS is usually more stable.
+If you want a free-tier scheduler later, use a separate private repository or a private GitHub Actions workflow with repository secrets, not this public repo.
 
 ## 9) Security notes
 
