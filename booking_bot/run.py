@@ -14,6 +14,7 @@ from dotenv import dotenv_values
 
 from .booking import BookingBot, BookingError, BookingResult, PreflightResult
 from .config import Settings
+from .notifier import EmailNotifier, EmailSettings, FallbackNotifier, InteractiveNotifier
 from .runtime_state import RunHistoryEntry, RunLockError, RuntimeStateStore, SchedulerState, utc_now
 from .telegram_client import TelegramNotifier
 
@@ -314,7 +315,7 @@ def _build_preflight_error_message(exc: Exception, mode: str) -> str:
     )
 
 
-def _send_result_screenshot(notifier: TelegramNotifier, screenshot_path: Path | None) -> None:
+def _send_result_screenshot(notifier: InteractiveNotifier, screenshot_path: Path | None) -> None:
     if not screenshot_path:
         return
     notifier.send_document(
@@ -331,7 +332,7 @@ def _run_lock_stale_after_sec(settings: Settings) -> int:
 
 async def run_once_detailed(
     settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     *,
     mode: str,
 ) -> RunOnceOutcome:
@@ -348,7 +349,7 @@ async def run_once_detailed(
                     "Booking run completed on attempt %s: no new bookings were needed.",
                     attempt,
                 )
-            notifier.send(_build_success_message(result, attempt, mode))
+            notifier.send(_build_success_message(result, attempt, mode), critical=True)
             _send_result_screenshot(notifier, result.screenshot_path)
             return RunOnceOutcome(
                 exit_code=0,
@@ -360,7 +361,11 @@ async def run_once_detailed(
             )
         except Exception as exc:
             LOGGER.exception("Booking attempt %s failed.", attempt)
-            notifier.send(_build_error_message(exc, attempt, mode))
+            final_attempt = attempt >= settings.retry_attempts
+            notifier.send(
+                _build_error_message(exc, attempt, mode),
+                critical=final_attempt,
+            )
             screenshot_path = exc.screenshot_path if isinstance(exc, BookingError) else None
             if isinstance(exc, BookingError):
                 _send_result_screenshot(notifier, exc.screenshot_path)
@@ -382,14 +387,14 @@ async def run_once_detailed(
     return last_outcome
 
 
-async def run_once(settings: Settings, notifier: TelegramNotifier) -> int:
+async def run_once(settings: Settings, notifier: InteractiveNotifier) -> int:
     outcome = await run_once_detailed(settings, notifier, mode=settings.run_mode)
     return outcome.exit_code
 
 
 async def run_preflight_once(
     settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     *,
     mode: str,
 ) -> PreflightOutcome:
@@ -660,7 +665,7 @@ def _build_selection_summary(settings: Settings, ui_state: ServiceUiState) -> st
 
 
 def _send_service_menu(
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     settings: Settings,
     ui_state: ServiceUiState,
     *,
@@ -827,6 +832,43 @@ def _is_preflight_due(
     return True, local_date
 
 
+def _is_healthcheck_due(
+    settings: Settings,
+    state: SchedulerState,
+    now_utc: datetime | None = None,
+) -> tuple[bool, date | None]:
+    if not settings.healthcheck_enabled:
+        return False, None
+    now_local = _schedule_local_now(settings, now_utc)
+    healthcheck_time = _parse_hhmm(settings.healthcheck_time_local)
+    healthcheck_dt = datetime.combine(
+        now_local.date(),
+        healthcheck_time,
+        tzinfo=now_local.tzinfo,
+    )
+    if now_local < healthcheck_dt:
+        return False, None
+    local_date = now_local.date()
+    if state.last_healthcheck_local_date == local_date.isoformat():
+        return False, local_date
+    return True, local_date
+
+
+def _build_healthcheck_message(settings: Settings, now_utc: datetime | None = None) -> str:
+    now_utc = now_utc or utc_now()
+    route = "proxy" if settings.telegram_proxy_enabled and settings.telegram_proxy_url else "direct"
+    proxy_label = settings.telegram_proxy_url or "disabled"
+    return (
+        "[workplace-booking] Daily Telegram health check\n"
+        f"Mode: {settings.run_mode}\n"
+        f"Route: {route}\n"
+        f"Proxy URL: {proxy_label}\n"
+        f"Office: {settings.target_office}\n"
+        f"Next scheduled booking: {settings.schedule_time_local} ({settings.schedule_local_utc_offset})\n"
+        f"UTC: {now_utc.isoformat()}"
+    )
+
+
 def _build_status_message(
     settings: Settings,
     store: RuntimeStateStore,
@@ -847,6 +889,11 @@ def _build_status_message(
     preflight_policy = (
         f"daily at {settings.auth_preflight_time_local} ({settings.schedule_local_utc_offset})"
         if settings.auth_preflight_enabled
+        else "disabled"
+    )
+    healthcheck_policy = (
+        f"daily at {settings.healthcheck_time_local} ({settings.schedule_local_utc_offset})"
+        if settings.healthcheck_enabled
         else "disabled"
     )
     next_run_utc_label = next_run_utc.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M")
@@ -880,6 +927,7 @@ def _build_status_message(
         f"Weekend policy: {weekend_policy}\n"
         f"Catch-up policy: {settings.schedule_catchup_window_minutes} minute window after missed scheduled run\n"
         f"Auth preflight: {preflight_policy}\n"
+        f"Telegram health check: {healthcheck_policy}\n"
         f"OTP policy: wait {settings.otp_wait_timeout_ms // 60000} min, remind every {settings.otp_reminder_interval_sec // 60} min\n"
         f"Run in progress: {in_progress}\n"
         f"Next scheduled run (local): {_format_local_dt(next_run_utc, settings.schedule_local_utc_offset)}\n"
@@ -972,7 +1020,7 @@ def _record_non_booking_result(
 
 async def _execute_booking_run(
     settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     store: RuntimeStateStore,
     *,
     mode: str,
@@ -1055,7 +1103,7 @@ async def _execute_booking_run(
 
 async def _execute_preflight(
     settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     store: RuntimeStateStore,
     *,
     mode: str,
@@ -1125,7 +1173,7 @@ async def _execute_preflight(
 
 async def _run_manual_booking_for_date(
     base_settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     store: RuntimeStateStore,
     target_date: date,
     target_seat: str | None = None,
@@ -1170,7 +1218,7 @@ async def _run_manual_booking_for_date(
 async def _handle_service_command(
     text: str,
     settings: Settings,
-    notifier: TelegramNotifier,
+    notifier: InteractiveNotifier,
     store: RuntimeStateStore,
     next_run_utc: datetime,
     ui_state: ServiceUiState,
@@ -1390,7 +1438,7 @@ async def _handle_service_command(
 
     return False, next_run_utc
 
-async def run_daemon(settings: Settings, notifier: TelegramNotifier) -> int:
+async def run_daemon(settings: Settings, notifier: InteractiveNotifier) -> int:
     store = _state_store(settings)
     LOGGER.info(
         "Running in daemon mode, interval %s minute(s).",
@@ -1403,7 +1451,7 @@ async def run_daemon(settings: Settings, notifier: TelegramNotifier) -> int:
         await asyncio.sleep(sleep_seconds)
 
 
-async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
+async def run_service(settings: Settings, notifier: InteractiveNotifier) -> int:
     store = _state_store(settings)
     next_run_utc = _next_scheduled_run_utc(settings)
     ui_state = ServiceUiState()
@@ -1427,6 +1475,19 @@ async def run_service(settings: Settings, notifier: TelegramNotifier) -> int:
     while True:
         now_utc = utc_now()
         state = store.load_scheduler_state()
+
+        healthcheck_due, healthcheck_local_date = _is_healthcheck_due(settings, state, now_utc)
+        if healthcheck_due:
+            notifier.send(
+                _build_healthcheck_message(settings, now_utc),
+                critical=False,
+            )
+            latest_state = store.load_scheduler_state()
+            if healthcheck_local_date is not None:
+                latest_state.last_healthcheck_local_date = healthcheck_local_date.isoformat()
+                store.save_scheduler_state(latest_state)
+            await asyncio.sleep(1)
+            continue
 
         preflight_due, preflight_local_date = _is_preflight_due(settings, state, now_utc)
         if preflight_due:
@@ -1567,12 +1628,40 @@ def main() -> int:
     settings = Settings.from_env()
     _configure_logging(settings.log_level)
 
-    notifier = TelegramNotifier(
+    email_notifier = EmailNotifier(
+        EmailSettings(
+            smtp_host=settings.email_smtp_host,
+            smtp_port=settings.email_smtp_port,
+            smtp_username=settings.email_smtp_username,
+            smtp_password=settings.email_smtp_password,
+            email_from=settings.email_from,
+            email_to=settings.email_to,
+            starttls=settings.email_smtp_starttls,
+        )
+    )
+    primary_notifier = TelegramNotifier(
         bot_token=settings.telegram_bot_token,
         chat_id=settings.telegram_chat_id,
         otp_reminder_interval_sec=settings.otp_reminder_interval_sec,
+        proxy_enabled=settings.telegram_proxy_enabled,
+        proxy_url=settings.telegram_proxy_url,
     )
+    notifier = FallbackNotifier(
+        primary_notifier,
+        email_notifier,
+        email_fallback_enabled=settings.email_fallback_enabled,
+    )
+    primary_notifier.transport_issue_reporter = notifier.report_transport_issue
+
     LOGGER.info("Telegram notifications enabled: %s", notifier.enabled)
+    LOGGER.info(
+        "Telegram proxy enabled: %s",
+        bool(settings.telegram_proxy_enabled and settings.telegram_proxy_url),
+    )
+    LOGGER.info(
+        "Email fallback enabled: %s",
+        bool(settings.email_fallback_enabled and email_notifier.enabled),
+    )
 
     if settings.run_mode == "daemon":
         return asyncio.run(run_daemon(settings, notifier))

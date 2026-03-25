@@ -6,6 +6,7 @@ import mimetypes
 from pathlib import Path
 import re
 import time
+from typing import Callable
 from urllib import parse, request
 
 
@@ -23,17 +24,31 @@ class TelegramNotifier:
         bot_token: str | None,
         chat_id: str | None,
         otp_reminder_interval_sec: int = OTP_REMINDER_INTERVAL_SEC,
+        *,
+        proxy_enabled: bool = False,
+        proxy_url: str | None = None,
+        transport_issue_reporter: Callable[[str, str], None] | None = None,
     ) -> None:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self._update_offset: int | None = None
         self.otp_reminder_interval_sec = max(1, int(otp_reminder_interval_sec))
+        self.proxy_enabled = bool(proxy_enabled and proxy_url)
+        self.proxy_url = proxy_url.strip() if proxy_url else None
+        self.transport_issue_reporter = transport_issue_reporter
+        self._proxy_opener = self._build_proxy_opener()
 
     @property
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
-    def send(self, message: str, reply_markup: dict[str, object] | None = None) -> bool:
+    def send(
+        self,
+        message: str,
+        reply_markup: dict[str, object] | None = None,
+        *,
+        critical: bool = False,
+    ) -> bool:
         if not self.enabled:
             LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")
             return False
@@ -57,6 +72,11 @@ class TelegramNotifier:
             except Exception:
                 if attempt >= 3:
                     LOGGER.exception("Failed to send Telegram notification.")
+                    self._report_transport_issue(
+                        "Telegram delivery failed",
+                        "Telegram sendMessage failed after retries.\n\n"
+                        f"Message:\n{message}",
+                    )
                     return False
                 LOGGER.warning(
                     "Telegram sendMessage failed on attempt %s/3, retrying.",
@@ -74,6 +94,7 @@ class TelegramNotifier:
         resize_keyboard: bool = True,
         one_time_keyboard: bool = False,
         selective: bool = False,
+        critical: bool = False,
     ) -> bool:
         keyboard = [[{"text": str(item)} for item in row] for row in rows if row]
         return self.send(
@@ -84,14 +105,16 @@ class TelegramNotifier:
                 "one_time_keyboard": bool(one_time_keyboard),
                 "selective": bool(selective),
             },
+            critical=critical,
         )
 
-    def send_remove_keyboard(self, message: str) -> bool:
+    def send_remove_keyboard(self, message: str, *, critical: bool = False) -> bool:
         return self.send(
             message,
             reply_markup={
                 "remove_keyboard": True,
             },
+            critical=critical,
         )
 
     def wait_for_otp_code(
@@ -118,10 +141,12 @@ class TelegramNotifier:
         )
         if context_message:
             message = f"{message}\n{context_message}"
-        self.send(message)
+        self.send(message, critical=True)
 
         deadline = time.monotonic() + timeout_sec
         next_reminder_at = time.monotonic() + self.otp_reminder_interval_sec
+        consecutive_poll_failures = 0
+        polling_alert_sent = False
         while time.monotonic() < deadline:
             now = time.monotonic()
             if now >= next_reminder_at:
@@ -143,11 +168,19 @@ class TelegramNotifier:
             timeout = min(poll_timeout_sec, remaining)
             try:
                 updates = self._get_updates(timeout=timeout)
+                consecutive_poll_failures = 0
             except Exception:
+                consecutive_poll_failures += 1
                 LOGGER.warning(
                     "Telegram getUpdates failed during OTP wait; retrying.",
                     exc_info=True,
                 )
+                if consecutive_poll_failures >= 3 and not polling_alert_sent:
+                    self._report_transport_issue(
+                        "Telegram polling failed repeatedly",
+                        "Telegram getUpdates failed repeatedly while waiting for OTP.",
+                    )
+                    polling_alert_sent = True
                 time.sleep(min(2, remaining))
                 continue
             for update in updates:
@@ -169,7 +202,8 @@ class TelegramNotifier:
 
         self.send(
             "[workplace-booking] OTP code was not received before timeout. "
-            "Current run will fail."
+            "Current run will fail.",
+            critical=True,
         )
         return None
 
@@ -178,7 +212,15 @@ class TelegramNotifier:
             return []
         timeout_sec = max(0, int(timeout_sec))
         self._prime_update_offset()
-        updates = self._get_updates(timeout=timeout_sec)
+        try:
+            updates = self._get_updates(timeout=timeout_sec)
+        except Exception as exc:
+            self._report_transport_issue(
+                "Telegram polling failed",
+                "Telegram getUpdates raised while polling service commands.\n\n"
+                f"Error: {exc.__class__.__name__}: {exc}",
+            )
+            raise
         out: list[dict[str, object]] = []
         for update in updates:
             message = update.get("message") or update.get("edited_message")
@@ -203,7 +245,13 @@ class TelegramNotifier:
             )
         return out
 
-    def send_document(self, path: Path, caption: str | None = None) -> bool:
+    def send_document(
+        self,
+        path: Path,
+        caption: str | None = None,
+        *,
+        critical: bool = False,
+    ) -> bool:
         if not self.enabled:
             LOGGER.debug("Telegram disabled because TELEGRAM_BOT_TOKEN/CHAT_ID not set.")
             return False
@@ -233,7 +281,7 @@ class TelegramNotifier:
                 method="POST",
             )
             try:
-                with request.urlopen(req, timeout=40) as response:
+                with self._urlopen(req, timeout=40) as response:
                     raw = response.read().decode("utf-8")
                     if response.status != 200:
                         raise RuntimeError(f"Telegram API HTTP {response.status}: {raw}")
@@ -244,6 +292,11 @@ class TelegramNotifier:
             except Exception:
                 if attempt >= 3:
                     LOGGER.exception("Failed to send Telegram document: %s", path)
+                    self._report_transport_issue(
+                        "Telegram document delivery failed",
+                        "Telegram sendDocument failed after retries.\n\n"
+                        f"Document: {path}\nCaption: {caption or ''}",
+                    )
                     return False
                 LOGGER.warning(
                     "Telegram sendDocument failed on attempt %s/3, retrying: %s",
@@ -331,7 +384,7 @@ class TelegramNotifier:
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             method="POST",
         )
-        with request.urlopen(req, timeout=timeout_sec) as response:
+        with self._urlopen(req, timeout=timeout_sec) as response:
             raw = response.read().decode("utf-8")
             if response.status != 200:
                 raise RuntimeError(f"Telegram API HTTP {response.status}: {raw}")
@@ -339,6 +392,31 @@ class TelegramNotifier:
             if not body.get("ok"):
                 raise RuntimeError(f"Telegram API error: {raw}")
             return body.get("result")
+
+    def _build_proxy_opener(self):
+        if not self.proxy_enabled or not self.proxy_url:
+            return None
+        return request.build_opener(
+            request.ProxyHandler(
+                {
+                    "http": self.proxy_url,
+                    "https": self.proxy_url,
+                }
+            )
+        )
+
+    def _urlopen(self, req: request.Request, timeout: int):
+        if self._proxy_opener is not None:
+            return self._proxy_opener.open(req, timeout=timeout)
+        return request.urlopen(req, timeout=timeout)
+
+    def _report_transport_issue(self, subject: str, body: str) -> None:
+        if self.transport_issue_reporter is None:
+            return
+        try:
+            self.transport_issue_reporter(subject, body)
+        except Exception:
+            LOGGER.exception("Transport issue reporter failed.")
 
     def _encode_multipart_formdata(
         self,

@@ -200,14 +200,26 @@ class Settings:
     schedule_catchup_window_minutes: int
     auth_preflight_enabled: bool
     auth_preflight_time_local: str
+    healthcheck_enabled: bool
+    healthcheck_time_local: str
     telegram_command_poll_timeout_sec: int
     run_history_limit: int
 
     storage_state_path: Path
     screenshot_dir: Path
 
+    telegram_proxy_enabled: bool
+    telegram_proxy_url: str | None
     telegram_bot_token: str | None
     telegram_chat_id: str | None
+    email_fallback_enabled: bool
+    email_smtp_host: str | None
+    email_smtp_port: int
+    email_smtp_username: str | None
+    email_smtp_password: str | None
+    email_from: str | None
+    email_to: str | None
+    email_smtp_starttls: bool
     log_level: str
 
     @classmethod
@@ -383,6 +395,10 @@ class Settings:
             auth_preflight_time_local=(
                 _env_optional("AUTH_PREFLIGHT_TIME_LOCAL") or "23:50"
             ),
+            healthcheck_enabled=_env_bool("HEALTHCHECK_ENABLED", False),
+            healthcheck_time_local=(
+                _env_optional("HEALTHCHECK_TIME_LOCAL") or "21:00"
+            ),
             telegram_command_poll_timeout_sec=_env_int(
                 "TELEGRAM_COMMAND_POLL_TIMEOUT_SEC",
                 12,
@@ -391,7 +407,17 @@ class Settings:
             run_history_limit=_env_int("RUN_HISTORY_LIMIT", 1000, min_value=1),
             storage_state_path=storage_state_path,
             screenshot_dir=screenshot_dir,
+            telegram_proxy_enabled=_env_bool("TELEGRAM_PROXY_ENABLED", False),
+            telegram_proxy_url=_env_optional("TELEGRAM_PROXY_URL"),
             telegram_bot_token=_env_optional("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env_optional("TELEGRAM_CHAT_ID"),
+            email_fallback_enabled=_env_bool("EMAIL_FALLBACK_ENABLED", False),
+            email_smtp_host=_env_optional("EMAIL_SMTP_HOST"),
+            email_smtp_port=_env_int("EMAIL_SMTP_PORT", 587, min_value=1),
+            email_smtp_username=_env_optional("EMAIL_SMTP_USERNAME"),
+            email_smtp_password=_env_optional("EMAIL_SMTP_PASSWORD"),
+            email_from=_env_optional("EMAIL_SMTP_FROM"),
+            email_to=_env_optional("EMAIL_SMTP_TO"),
+            email_smtp_starttls=_env_bool("EMAIL_SMTP_STARTTLS", True),
             log_level=(_env_optional("LOG_LEVEL") or "INFO").upper(),
         )

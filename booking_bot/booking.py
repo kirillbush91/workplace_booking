@@ -21,7 +21,8 @@ from playwright.async_api import (
 )
 
 from .config import Settings
-from .telegram_client import OtpWaitCancelledError, TelegramNotifier
+from .notifier import InteractiveNotifier
+from .telegram_client import OtpWaitCancelledError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -115,7 +116,7 @@ class BookingBot:
     def __init__(
         self,
         settings: Settings,
-        notifier: TelegramNotifier | None = None,
+        notifier: InteractiveNotifier | None = None,
     ) -> None:
         self.settings = settings
         self.notifier = notifier

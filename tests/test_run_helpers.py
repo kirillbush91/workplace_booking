@@ -11,6 +11,7 @@ from booking_bot.config import Settings
 from booking_bot.run import (
     _build_schedule_preview,
     _compute_catchup_decision,
+    _is_healthcheck_due,
     _scheduled_target_date_for_run,
     _settings_for_manual_request,
 )
@@ -36,6 +37,8 @@ class RunHelperTests(unittest.TestCase):
             "BOOKING_SKIP_WEEKENDS": "true",
             "AUTH_PREFLIGHT_ENABLED": "true",
             "AUTH_PREFLIGHT_TIME_LOCAL": "23:50",
+            "HEALTHCHECK_ENABLED": "true",
+            "HEALTHCHECK_TIME_LOCAL": "21:00",
             "SCHEDULE_CATCHUP_WINDOW_MINUTES": "360",
         }
         with patch.dict(os.environ, env, clear=True):
@@ -69,6 +72,20 @@ class RunHelperTests(unittest.TestCase):
         self.assertEqual(manual.preferred_seats, ["19"])
         self.assertEqual(manual.target_seat, "19")
         self.assertIsNone(manual.target_table_id)
+
+    def test_healthcheck_becomes_due_after_configured_time_once_per_day(self) -> None:
+        settings = self._settings()
+        now_utc = datetime(2026, 3, 25, 18, 5, tzinfo=timezone.utc)
+        due, local_date = _is_healthcheck_due(settings, SchedulerState(), now_utc)
+        self.assertTrue(due)
+        self.assertEqual(local_date.isoformat(), "2026-03-25")
+
+        due_again, _ = _is_healthcheck_due(
+            settings,
+            SchedulerState(last_healthcheck_local_date="2026-03-25"),
+            now_utc,
+        )
+        self.assertFalse(due_again)
 
 
 if __name__ == "__main__":

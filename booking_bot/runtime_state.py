@@ -30,6 +30,7 @@ class SchedulerState:
     catchup_executed_for_local_date: str | None = None
     in_progress_run_id: str | None = None
     last_preflight_local_date: str | None = None
+    last_healthcheck_local_date: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "SchedulerState":
@@ -49,6 +50,9 @@ class SchedulerState:
             ),
             in_progress_run_id=_as_optional_str(raw.get("in_progress_run_id")),
             last_preflight_local_date=_as_optional_str(raw.get("last_preflight_local_date")),
+            last_healthcheck_local_date=_as_optional_str(
+                raw.get("last_healthcheck_local_date")
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

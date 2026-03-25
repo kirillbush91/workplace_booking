@@ -38,6 +38,8 @@ Fill `.env`:
 - repo already contains current non-secret runtime settings in `.env.shared`
 - set `USERNAME` and `PASSWORD` in local `.env` for LDAP form auto-fill
 - add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in local `.env` for alerts
+- if Telegram must go out through a private proxy over AmneziaWG/WireGuard, set `TELEGRAM_PROXY_ENABLED=true` and `TELEGRAM_PROXY_URL=http://<wg_proxy_ip>:<port>`
+- if you want critical-event email fallback, set `EMAIL_FALLBACK_ENABLED=true` and SMTP settings in local `.env`
 - if `OTP_CODE_VALUE` is empty, bot will request OTP code in Telegram and wait for your reply
 - `.env` is local-only and must not be committed to git
 
@@ -68,6 +70,18 @@ USERNAME=...
 PASSWORD=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
+TELEGRAM_PROXY_ENABLED=false
+TELEGRAM_PROXY_URL=
+EMAIL_FALLBACK_ENABLED=false
+EMAIL_SMTP_HOST=
+EMAIL_SMTP_PORT=587
+EMAIL_SMTP_USERNAME=
+EMAIL_SMTP_PASSWORD=
+EMAIL_SMTP_FROM=
+EMAIL_SMTP_TO=
+EMAIL_SMTP_STARTTLS=true
+HEALTHCHECK_ENABLED=false
+HEALTHCHECK_TIME_LOCAL=21:00
 HEADLESS=false
 RUN_MODE=once
 ```
@@ -314,6 +328,9 @@ If session is still valid, OTP/login steps are skipped automatically.
 Create bot in Telegram via `@BotFather`, then set:
 - `TELEGRAM_BOT_TOKEN=...`
 - `TELEGRAM_CHAT_ID=...`
+- optional private proxy for Telegram only:
+  - `TELEGRAM_PROXY_ENABLED=true`
+  - `TELEGRAM_PROXY_URL=http://<wg_ip_of_foreign_vps>:3128`
 
 Messages include:
 - start of each attempt,
@@ -329,6 +346,36 @@ Messages include:
 - screenshot file path.
 - screenshot file attachment in Telegram (`sendDocument`).
 
+### Email fallback for critical events
+
+If Telegram delivery is unstable, you can enable email fallback for critical events only:
+- `EMAIL_FALLBACK_ENABLED=true`
+- `EMAIL_SMTP_HOST`
+- `EMAIL_SMTP_PORT` (default `587`)
+- `EMAIL_SMTP_USERNAME`
+- `EMAIL_SMTP_PASSWORD`
+- `EMAIL_SMTP_FROM`
+- `EMAIL_SMTP_TO`
+- `EMAIL_SMTP_STARTTLS=true|false`
+
+Email fallback duplicates only critical events:
+- OTP request start,
+- OTP timeout,
+- final booking success/finish,
+- final booking failure,
+- repeated Telegram delivery/polling failures.
+
+It does **not** replace Telegram commands and does not accept OTP replies by email.
+
+### Daily Telegram health check
+
+You can enable a daily Telegram transport check message:
+- `HEALTHCHECK_ENABLED=true`
+- `HEALTHCHECK_TIME_LOCAL=21:00`
+
+In service mode, the bot sends one short test message per local day after the configured time.
+This is useful to confirm that the Telegram delivery route is still alive before the nightly booking window.
+
 ## 5) Autonomous run modes
 
 - `RUN_MODE=once`: one run, with internal retries (`RETRY_ATTEMPTS`, `RETRY_DELAY_SEC`).
@@ -339,6 +386,8 @@ Messages include:
   - `SCHEDULE_CATCHUP_WINDOW_MINUTES`: if VPS/container was down at `00:01`, the bot can execute the missed run automatically after restart.
   - `AUTH_PREFLIGHT_ENABLED=true`: run read-only auth/session self-check before the booking window.
   - `AUTH_PREFLIGHT_TIME_LOCAL=23:50`: preflight time in scheduler local timezone.
+  - `HEALTHCHECK_ENABLED=true`: send one Telegram transport health-check message per day.
+  - `HEALTHCHECK_TIME_LOCAL=21:00`: health-check time in scheduler local timezone.
   - `RUN_HISTORY_LIMIT`: number of stored run-history entries in `.state/run_history.jsonl`.
   Telegram commands:
   - `/help`
@@ -445,6 +494,14 @@ Set at least:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 
+Optional but recommended for RU deployments with Telegram instability:
+- `TELEGRAM_PROXY_ENABLED=true`
+- `TELEGRAM_PROXY_URL=http://<foreign_vps_wg_ip>:3128`
+- `EMAIL_FALLBACK_ENABLED=true`
+- SMTP settings for your mailbox
+- `HEALTHCHECK_ENABLED=true`
+- `HEALTHCHECK_TIME_LOCAL=21:00`
+
 4. Start bot:
 
 ```bash
@@ -463,6 +520,26 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now workplace-booking-bot.service
 sudo systemctl status workplace-booking-bot.service
 ```
+
+### AmneziaWG + private proxy layout
+
+Recommended network layout when Telegram is unstable from your bot VPS:
+1. Keep the booking bot on the main VPS where Playwright/browser automation already works.
+2. Join that main VPS to your AmneziaWG network as a peer.
+3. On the foreign VPS, run a lightweight HTTP CONNECT proxy (`tinyproxy` or `3proxy`) bound only to the WG interface.
+4. Set `TELEGRAM_PROXY_URL` to that private WG address.
+5. Do **not** change the default route for the whole bot host; only Telegram API traffic should use the proxy.
+
+This keeps booking/SSO traffic on the original route and uses the foreign VPS only as a transport hop for Telegram.
+
+### Telegram-only tunnel without firewall changes
+
+If you must avoid firewall changes on both VPS hosts, an alternative working setup is:
+1. run the Telegram CONNECT proxy on the foreign VPS bound to `127.0.0.1:3128`;
+2. run a persistent SSH local-forward on the main VPS, for example `127.0.0.1:43128 -> foreign-vps:127.0.0.1:3128`;
+3. point the bot to `TELEGRAM_PROXY_URL=http://127.0.0.1:43128`.
+
+This keeps the tunnel private, changes no default route, and isolates the workaround to Telegram traffic only.
 
 ## 8) Free cloud deployment
 
