@@ -322,6 +322,8 @@ Recommended setup:
 3. bot saves session state to `STORAGE_STATE_PATH` and re-uses it next runs.
 
 If session is still valid, OTP/login steps are skipped automatically.
+If preflight says the saved session is no longer valid, send `/reauth` or tap `Re-auth`
+in service mode to refresh login/OTP without creating a booking.
 
 ## 4) Telegram notifications
 
@@ -394,6 +396,7 @@ This is useful to confirm that the Telegram delivery route is still alive before
   - `/menu`
   - `/status`
   - `/preflight`
+  - `/reauth`
   - `/last`
   - `/history`
   - `/run`

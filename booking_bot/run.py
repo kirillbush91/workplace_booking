@@ -12,7 +12,13 @@ import uuid
 
 from dotenv import dotenv_values
 
-from .booking import BookingBot, BookingError, BookingResult, PreflightResult
+from .booking import (
+    AuthRefreshResult,
+    BookingBot,
+    BookingError,
+    BookingResult,
+    PreflightResult,
+)
 from .config import Settings
 from .notifier import EmailNotifier, EmailSettings, FallbackNotifier, InteractiveNotifier
 from .runtime_state import RunHistoryEntry, RunLockError, RuntimeStateStore, SchedulerState, utc_now
@@ -33,6 +39,7 @@ BTN_BACK = "Back"
 BTN_CANCEL = "Cancel"
 BTN_ENTER_SEAT = "Enter seat"
 BTN_PREFLIGHT = "Preflight"
+BTN_REAUTH = "Re-auth"
 BTN_LAST_RUN = "Last run"
 BTN_HISTORY = "History"
 
@@ -60,6 +67,16 @@ class PreflightOutcome:
     exit_code: int
     result: PreflightResult | None = None
     error_message: str | None = None
+
+
+@dataclass
+class ReauthOutcome:
+    exit_code: int
+    result: AuthRefreshResult | None = None
+    error_message: str | None = None
+    screenshot_path: Path | None = None
+    otp_requested: bool = False
+    otp_received: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,6 +228,25 @@ def _preflight_summary(result: PreflightResult) -> str:
     return "; ".join(dict.fromkeys(part for part in parts if part))
 
 
+def _reauth_status(result: AuthRefreshResult) -> str:
+    if result.session_valid:
+        return "ok"
+    return "warning"
+
+
+def _reauth_summary(result: AuthRefreshResult) -> str:
+    parts = [result.message]
+    if result.login_required:
+        parts.append("login required")
+    if result.otp_likely:
+        parts.append("otp likely")
+    if result.office_map_available:
+        parts.append("office map available")
+    if result.storage_state_saved:
+        parts.append("storage saved")
+    return "; ".join(dict.fromkeys(part for part in parts if part))
+
+
 def _build_success_message(result: BookingResult, attempt: int, mode: str) -> str:
     duration = (result.finished_at - result.started_at).total_seconds()
     screenshot = str(result.screenshot_path) if result.screenshot_path else "n/a"
@@ -290,6 +326,9 @@ def _build_preflight_result_message(result: PreflightResult, mode: str) -> str:
     storage_age = "n/a"
     if result.storage_state_age_sec is not None:
         storage_age = f"{result.storage_state_age_sec}s"
+    next_step = ""
+    if status != "ok":
+        next_step = "\nNext: send /reauth or tap Re-auth to refresh saved session."
     return (
         "[workplace-booking] Auth preflight finished\n"
         f"Mode: {mode}\n"
@@ -302,6 +341,7 @@ def _build_preflight_result_message(result: PreflightResult, mode: str) -> str:
         f"Storage state age: {storage_age}\n"
         f"Current URL: {result.current_url}\n"
         f"Summary: {result.message}"
+        f"{next_step}"
     )
 
 
@@ -311,6 +351,48 @@ def _build_preflight_error_message(exc: Exception, mode: str) -> str:
         "[workplace-booking] Auth preflight failed\n"
         f"Mode: {mode}\n"
         f"Error: {stack}\n"
+        f"UTC: {utc_now().isoformat()}"
+    )
+
+
+def _build_reauth_start_message(settings: Settings, mode: str) -> str:
+    return (
+        "[workplace-booking] Auth refresh started\n"
+        f"Mode: {mode}\n"
+        f"Office: {settings.target_office}\n"
+        f"Storage state: {settings.storage_state_path}\n"
+        "Booking will not be attempted in this run.\n"
+        f"UTC: {utc_now().isoformat()}"
+    )
+
+
+def _build_reauth_result_message(result: AuthRefreshResult, mode: str) -> str:
+    status = _reauth_status(result)
+    return (
+        "[workplace-booking] Auth refresh finished\n"
+        f"Mode: {mode}\n"
+        f"Status: {status}\n"
+        f"Session valid: {result.session_valid}\n"
+        f"Login required: {result.login_required}\n"
+        f"OTP likely: {result.otp_likely}\n"
+        f"OTP requested/received: {result.otp_requested}/{result.otp_received}\n"
+        f"Office map available: {result.office_map_available}\n"
+        f"Storage state saved: {result.storage_state_saved}\n"
+        f"Current URL: {result.current_url}\n"
+        f"Summary: {result.message}"
+    )
+
+
+def _build_reauth_error_message(exc: Exception, mode: str) -> str:
+    screenshot = "n/a"
+    if isinstance(exc, BookingError) and exc.screenshot_path is not None:
+        screenshot = str(exc.screenshot_path)
+    stack = traceback.format_exception_only(exc.__class__, exc)[-1].strip()
+    return (
+        "[workplace-booking] Auth refresh failed\n"
+        f"Mode: {mode}\n"
+        f"Error: {stack}\n"
+        f"Screenshot: {screenshot}\n"
         f"UTC: {utc_now().isoformat()}"
     )
 
@@ -408,6 +490,42 @@ async def run_preflight_once(
         LOGGER.exception("Auth preflight failed.")
         notifier.send(_build_preflight_error_message(exc, mode))
         return PreflightOutcome(exit_code=1, error_message=str(exc))
+
+
+async def run_reauth_once(
+    settings: Settings,
+    notifier: InteractiveNotifier,
+    *,
+    mode: str,
+) -> ReauthOutcome:
+    notifier.send(_build_reauth_start_message(settings, mode))
+    bot = BookingBot(settings, notifier=notifier)
+    try:
+        result = await bot.refresh_auth()
+        notifier.send(
+            _build_reauth_result_message(result, mode),
+            critical=not result.session_valid,
+        )
+        return ReauthOutcome(
+            exit_code=0 if result.session_valid else 1,
+            result=result,
+            otp_requested=result.otp_requested,
+            otp_received=result.otp_received,
+        )
+    except Exception as exc:
+        LOGGER.exception("Auth refresh failed.")
+        notifier.send(_build_reauth_error_message(exc, mode), critical=True)
+        screenshot_path = exc.screenshot_path if isinstance(exc, BookingError) else None
+        if isinstance(exc, BookingError):
+            _send_result_screenshot(notifier, exc.screenshot_path)
+        return ReauthOutcome(
+            exit_code=1,
+            error_message=str(exc),
+            screenshot_path=screenshot_path,
+            otp_requested=bot.otp_requested,
+            otp_received=bot.otp_received,
+        )
+
 
 def _parse_utc_offset(value: str) -> timezone:
     raw = (value or "").strip()
@@ -562,8 +680,9 @@ def _menu_keyboard_rows() -> list[list[str]]:
         [BTN_RUN_NEXT, BTN_STATUS],
         [BTN_PICK_DATE, BTN_PICK_SEAT],
         [BTN_RUN_SELECTED, BTN_RESET_SELECTIONS],
-        [BTN_PREFLIGHT, BTN_LAST_RUN],
-        [BTN_HISTORY, "/help"],
+        [BTN_PREFLIGHT, BTN_REAUTH],
+        [BTN_LAST_RUN, BTN_HISTORY],
+        ["/help"],
     ]
 
 
@@ -682,6 +801,7 @@ def _build_service_help() -> str:
         "/menu - show buttons/menu\n"
         "/status - show bot status and next scheduled run\n"
         "/preflight - run auth/session self-check\n"
+        "/reauth - refresh saved auth session with login/OTP, without booking\n"
         "/last - show last completed run\n"
         "/history - show last 10 runs\n"
         "/run - run booking now using scheduled +7 logic\n"
@@ -1171,6 +1291,73 @@ async def _execute_preflight(
         store.release_run_lock(run_id)
 
 
+async def _execute_reauth(
+    settings: Settings,
+    notifier: InteractiveNotifier,
+    store: RuntimeStateStore,
+    *,
+    mode: str,
+) -> ReauthOutcome:
+    run_id = uuid.uuid4().hex
+    started_at = utc_now()
+    state = store.load_scheduler_state()
+    try:
+        store.acquire_run_lock(run_id, stale_after_sec=_run_lock_stale_after_sec(settings))
+    except RunLockError as exc:
+        LOGGER.warning("Could not acquire run lock for auth refresh: %s", exc)
+        notifier.send(f"[workplace-booking] Auth refresh skipped: {exc}")
+        return ReauthOutcome(exit_code=1, error_message=str(exc))
+
+    state.in_progress_run_id = run_id
+    state.last_run_started_at_utc = started_at.isoformat()
+    state.last_run_mode = mode
+    store.save_scheduler_state(state)
+
+    try:
+        outcome = await run_reauth_once(settings, notifier, mode=mode)
+        finished_at = utc_now()
+        if outcome.result is not None:
+            status = _reauth_status(outcome.result)
+            summary = _reauth_summary(outcome.result)
+        else:
+            status = "failed"
+            summary = outcome.error_message or "Auth refresh failed."
+
+        latest_state = store.load_scheduler_state()
+        latest_state.last_run_started_at_utc = started_at.isoformat()
+        latest_state.last_run_finished_at_utc = finished_at.isoformat()
+        latest_state.last_run_status = status
+        latest_state.last_run_mode = mode
+        latest_state.last_run_message = summary
+        latest_state.in_progress_run_id = None
+        store.save_scheduler_state(latest_state)
+
+        store.append_run_history(
+            _build_run_history_entry(
+                run_id=run_id,
+                mode=mode,
+                started_at_utc=started_at,
+                finished_at_utc=finished_at,
+                target_date=None,
+                seat_attempt_order=_seat_order(settings),
+                chosen_seat=None,
+                status=status,
+                summary=summary,
+                otp_requested=outcome.otp_requested,
+                otp_received=outcome.otp_received,
+                screenshot_path=outcome.screenshot_path,
+            ),
+            limit=settings.run_history_limit,
+        )
+        return outcome
+    finally:
+        latest_state = store.load_scheduler_state()
+        if latest_state.in_progress_run_id == run_id:
+            latest_state.in_progress_run_id = None
+            store.save_scheduler_state(latest_state)
+        store.release_run_lock(run_id)
+
+
 async def _run_manual_booking_for_date(
     base_settings: Settings,
     notifier: InteractiveNotifier,
@@ -1259,6 +1446,14 @@ async def _handle_service_command(
     if normalized == BTN_PREFLIGHT or normalized.startswith("/preflight"):
         local_date = _schedule_local_now(settings).date()
         await _execute_preflight(settings, notifier, store, mode="preflight", local_date=local_date)
+        return True, next_run_utc
+
+    if (
+        normalized == BTN_REAUTH
+        or lowered.startswith("/reauth")
+        or lowered.startswith("/auth")
+    ):
+        await _execute_reauth(settings, notifier, store, mode="reauth")
         return True, next_run_utc
 
     if normalized == BTN_LAST_RUN or normalized.startswith("/last"):
@@ -1423,6 +1618,8 @@ async def _handle_service_command(
         "status": BTN_STATUS,
         "menu": BTN_MENU,
         "preflight": BTN_PREFLIGHT,
+        "reauth": BTN_REAUTH,
+        "auth": BTN_REAUTH,
         "last": BTN_LAST_RUN,
         "history": BTN_HISTORY,
     }

@@ -94,6 +94,21 @@ class PreflightResult:
 
 
 @dataclass(frozen=True)
+class AuthRefreshResult:
+    started_at: datetime
+    finished_at: datetime
+    session_valid: bool
+    login_required: bool
+    otp_likely: bool
+    office_map_available: bool
+    storage_state_saved: bool
+    current_url: str
+    message: str
+    otp_requested: bool
+    otp_received: bool
+
+
+@dataclass(frozen=True)
 class MarkerRequestEvent:
     path: str
     method: str
@@ -153,7 +168,7 @@ class BookingBot:
                 page.set_default_timeout(self.settings.default_timeout_ms)
 
                 LOGGER.info("Opening booking page: %s", self.settings.booking_url)
-                await page.goto(self.settings.booking_url, wait_until="domcontentloaded")
+                await self._goto_page(page, self.settings.booking_url, purpose="booking page")
                 await self._pause(page)
 
                 if self.settings.page_ready_selector:
@@ -285,7 +300,7 @@ class BookingBot:
                 page.set_default_timeout(self.settings.default_timeout_ms)
 
                 LOGGER.info("Running auth preflight for %s", self.settings.booking_url)
-                await page.goto(self.settings.booking_url, wait_until="domcontentloaded")
+                await self._goto_page(page, self.settings.booking_url, purpose="auth preflight")
                 await self._pause(page)
 
                 if self.settings.page_ready_selector:
@@ -364,6 +379,219 @@ class BookingBot:
                     await browser.close()
                 except Exception:
                     pass
+
+    async def refresh_auth(self) -> AuthRefreshResult:
+        started_at = datetime.now(timezone.utc)
+        browser: Browser | None = None
+        context: BrowserContext | None = None
+        page: Page | None = None
+        screenshot: Path | None = None
+
+        office_map_available = False
+        storage_state_saved = False
+        login_required = False
+        otp_likely = False
+        current_url = self.settings.booking_url
+        message = "Authentication refresh did not complete."
+
+        try:
+            async with async_playwright() as playwright:
+                browser = await playwright.chromium.launch(headless=self.settings.headless)
+                context = await self._new_context(browser)
+                page = await context.new_page()
+                page.on("close", lambda: LOGGER.debug("Playwright page was closed."))
+                self._attach_page_trackers(page)
+                page.set_default_timeout(self.settings.default_timeout_ms)
+
+                LOGGER.info("Refreshing auth session for %s", self.settings.booking_url)
+                await self._goto_page(page, self.settings.booking_url, purpose="auth refresh")
+                await self._pause(page)
+
+                if self.settings.page_ready_selector:
+                    try:
+                        await page.locator(self.settings.page_ready_selector).first.wait_for(
+                            state="visible",
+                            timeout=min(self.settings.default_timeout_ms, 5_000),
+                        )
+                    except Exception:
+                        pass
+
+                await self._perform_pre_login_actions(page)
+                await self._handle_otp_if_needed(page)
+                await self._login_if_needed(page)
+                await self._handle_otp_if_needed(page)
+
+                storage_state_saved = await self._persist_storage_state_safe(
+                    context,
+                    phase="post-auth-refresh",
+                    target_closed_level="debug",
+                )
+
+                try:
+                    await self._select_office(page)
+                    office_map_available = True
+                except Exception:
+                    LOGGER.warning(
+                        "Office map could not be opened after auth refresh.",
+                        exc_info=True,
+                    )
+                current_url = page.url
+
+                storage_state_saved = (
+                    await self._persist_storage_state_safe(
+                        context,
+                        phase="post-auth-refresh-verify",
+                        target_closed_level="debug",
+                    )
+                    or storage_state_saved
+                )
+
+                username_entry = await self._first_visible_selector(
+                    page=page,
+                    selectors=self.settings.login_username_selectors,
+                    total_timeout_ms=1_500,
+                )
+                password_entry = await self._first_visible_selector(
+                    page=page,
+                    selectors=self.settings.login_password_selectors,
+                    total_timeout_ms=1_500,
+                )
+                login_required = username_entry is not None or password_entry is not None
+
+                if not login_required and self.settings.otp_code_input_selector:
+                    otp_input = page.locator(self.settings.otp_code_input_selector).first
+                    try:
+                        await otp_input.wait_for(state="visible", timeout=1_500)
+                        otp_likely = await self._otp_screen_hints_present(page)
+                    except Exception:
+                        otp_likely = False
+
+                session_valid = (
+                    office_map_available
+                    and storage_state_saved
+                    and not login_required
+                    and not otp_likely
+                )
+                if session_valid:
+                    message = "Authentication refreshed and saved session is valid."
+                elif login_required:
+                    message = "Login form is still visible after auth refresh."
+                elif otp_likely:
+                    message = "OTP screen is still visible after auth refresh."
+                elif not storage_state_saved:
+                    message = "Authentication flow ran, but browser storage state was not saved."
+                elif not office_map_available:
+                    message = "Authentication flow ran, but office map could not be opened."
+                else:
+                    message = "Authentication refresh finished with warnings."
+
+                finished_at = datetime.now(timezone.utc)
+                return AuthRefreshResult(
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    session_valid=session_valid,
+                    login_required=login_required,
+                    otp_likely=otp_likely,
+                    office_map_available=office_map_available,
+                    storage_state_saved=storage_state_saved,
+                    current_url=current_url,
+                    message=message,
+                    otp_requested=self._otp_requested,
+                    otp_received=self._otp_received,
+                )
+        except Exception as exc:
+            if page is not None and not page.is_closed():
+                try:
+                    screenshot = await self._capture_screenshot(page, "auth_refresh_error")
+                except Exception:
+                    LOGGER.exception("Failed to capture auth refresh error screenshot.")
+            raise BookingError(
+                f"{exc.__class__.__name__}: {exc}",
+                screenshot_path=screenshot,
+            ) from exc
+        finally:
+            if context is not None:
+                await self._persist_storage_state_safe(
+                    context,
+                    phase="auth-refresh-finalize",
+                    target_closed_level=(
+                        "debug" if self._storage_state_saved_at_least_once else "warning"
+                    ),
+                )
+                try:
+                    await context.close()
+                except Exception as exc:
+                    if self._is_target_closed_exception(exc):
+                        LOGGER.debug("Browser context was already closed.")
+                    else:
+                        LOGGER.exception("Failed to close browser context cleanly.")
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception as exc:
+                    if self._is_target_closed_exception(exc):
+                        LOGGER.debug("Browser was already closed.")
+                    else:
+                        LOGGER.exception("Failed to close browser cleanly.")
+
+    async def _goto_page(self, page: Page, url: str, *, purpose: str) -> None:
+        timeout_ms = max(
+            self.settings.default_timeout_ms,
+            self.settings.office_map_wait_timeout_ms,
+        )
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except PlaywrightTimeoutError:
+            current_url = page.url or ""
+            if current_url and current_url != "about:blank":
+                LOGGER.warning(
+                    "Navigation for %s timed out waiting for domcontentloaded "
+                    "after %sms; continuing with current URL: %s",
+                    purpose,
+                    timeout_ms,
+                    current_url,
+                )
+                return
+            LOGGER.warning(
+                "Navigation for %s timed out waiting for domcontentloaded "
+                "after %sms; retrying with commit.",
+                purpose,
+                timeout_ms,
+            )
+
+        try:
+            await page.goto(url, wait_until="commit", timeout=timeout_ms)
+        except PlaywrightTimeoutError:
+            current_url = page.url or ""
+            if current_url and current_url != "about:blank":
+                LOGGER.warning(
+                    "Navigation for %s timed out waiting for commit after %sms; "
+                    "continuing with current URL: %s",
+                    purpose,
+                    timeout_ms,
+                    current_url,
+                )
+                return
+            raise
+        await self._wait_for_domcontentloaded_optional(page, purpose=purpose)
+
+    async def _wait_for_domcontentloaded_optional(
+        self,
+        page: Page,
+        *,
+        purpose: str,
+        timeout_ms: int | None = None,
+    ) -> None:
+        wait_ms = timeout_ms or min(self.settings.default_timeout_ms, 10_000)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=wait_ms)
+        except PlaywrightTimeoutError:
+            LOGGER.warning(
+                "Timed out waiting for domcontentloaded after %sms (%s); continuing.",
+                wait_ms,
+                purpose,
+            )
 
     async def _persist_storage_state_safe(
         self,
@@ -461,7 +689,7 @@ class BookingBot:
         else:
             LOGGER.info("Login submit not found, continuing.")
 
-        await page.wait_for_load_state("domcontentloaded")
+        await self._wait_for_domcontentloaded_optional(page, purpose="post-login navigation")
         await self._pause(page)
         await self._handle_otp_if_needed(page)
 
@@ -550,7 +778,7 @@ class BookingBot:
                     "Set OTP_CODE_VALUE or increase OTP_WAIT_TIMEOUT_MS."
                 ) from None
 
-        await page.wait_for_load_state("domcontentloaded")
+        await self._wait_for_domcontentloaded_optional(page, purpose="post-OTP navigation")
         await self._pause(page)
 
     async def _otp_screen_hints_present(self, page: Page) -> bool:
@@ -575,7 +803,10 @@ class BookingBot:
                 await locator.wait_for(state="visible", timeout=timeout_ms)
                 LOGGER.info("Clicking pre-login selector: %s", selector)
                 await self._click_locator(page, locator)
-                await page.wait_for_load_state("domcontentloaded")
+                await self._wait_for_domcontentloaded_optional(
+                    page,
+                    purpose=f"pre-login selector '{selector}'",
+                )
             except Exception:
                 continue
 
@@ -585,7 +816,10 @@ class BookingBot:
                 await locator.wait_for(state="visible", timeout=timeout_ms)
                 LOGGER.info("Clicking pre-login text: %s", text)
                 await self._click_locator(page, locator)
-                await page.wait_for_load_state("domcontentloaded")
+                await self._wait_for_domcontentloaded_optional(
+                    page,
+                    purpose=f"pre-login text '{text}'",
+                )
             except Exception:
                 continue
 
@@ -610,7 +844,7 @@ class BookingBot:
             )
             parsed = urlparse(page.url)
             offices_url = urlunparse(parsed._replace(path="/offices", query="", fragment=""))
-            await page.goto(offices_url, wait_until="domcontentloaded")
+            await self._goto_page(page, offices_url, purpose="office selection page")
             await self._pause(page)
 
         if self.settings.office_choose_selector:
@@ -1433,6 +1667,34 @@ class BookingBot:
                 credentials: "include",
                 headers: { ...(headers || {}) },
               };
+              const upperMethod = String(init.method || "GET").toUpperCase();
+              const unsafeMethod = !["GET", "HEAD", "OPTIONS", "TRACE"].includes(upperMethod);
+              const hasCsrfHeader = Object.keys(init.headers).some(
+                (key) => key.toLowerCase() === "x-csrftoken" || key.toLowerCase() === "x-csrf-token"
+              );
+              if (unsafeMethod && !hasCsrfHeader) {
+                const readCookie = (name) => {
+                  const prefix = `${name}=`;
+                  for (const rawPart of document.cookie.split(";")) {
+                    const part = rawPart.trim();
+                    if (part.startsWith(prefix)) {
+                      return decodeURIComponent(part.slice(prefix.length));
+                    }
+                  }
+                  return "";
+                };
+                const csrfToken =
+                  readCookie("csrftoken") ||
+                  readCookie("csrf_token") ||
+                  readCookie("XSRF-TOKEN") ||
+                  readCookie("xsrf-token") ||
+                  document.querySelector('meta[name="csrf-token"]')?.getAttribute("content") ||
+                  document.querySelector('meta[name="csrf"]')?.getAttribute("content") ||
+                  "";
+                if (csrfToken) {
+                  init.headers["X-CSRFToken"] = csrfToken;
+                }
+              }
               if (body && typeof body === "object") {
                 init.headers["content-type"] = "application/json";
                 init.body = JSON.stringify(body);
@@ -1687,6 +1949,30 @@ class BookingBot:
                 return None
 
         month_map = {
+            "jan": 1,
+            "january": 1,
+            "feb": 2,
+            "february": 2,
+            "mar": 3,
+            "march": 3,
+            "apr": 4,
+            "april": 4,
+            "may": 5,
+            "jun": 6,
+            "june": 6,
+            "jul": 7,
+            "july": 7,
+            "aug": 8,
+            "august": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "oct": 10,
+            "october": 10,
+            "nov": 11,
+            "november": 11,
+            "dec": 12,
+            "december": 12,
             "янв": 1,
             "фев": 2,
             "мар": 3,
@@ -1701,7 +1987,7 @@ class BookingBot:
             "ноя": 11,
             "дек": 12,
         }
-        named_match = re.search(r"\b(\d{1,2})\s+([а-яё]{3,})\b", text)
+        named_match = re.search(r"\b(\d{1,2})\s+([a-zа-яё]{3,})\b", text)
         if not named_match:
             return None
 
@@ -1981,7 +2267,7 @@ class BookingBot:
                 explicit_window.date_from,
                 explicit_window.date_to,
             )
-            await page.goto(new_url, wait_until="domcontentloaded")
+            await self._goto_page(page, new_url, purpose="map explicit date/time URL")
             await self._wait_for_office_map_ready(page)
             return True
 
@@ -2013,7 +2299,7 @@ class BookingBot:
             query["date_from"][0],
             query["date_to"][0],
         )
-        await page.goto(new_url, wait_until="domcontentloaded")
+        await self._goto_page(page, new_url, purpose="map explicit date URL")
         await self._wait_for_office_map_ready(page)
         return True
 
@@ -2118,6 +2404,12 @@ class BookingBot:
     async def _try_open_date_picker_by_text(self, page: Page) -> bool:
         # Handles localized labels like "Ср, 11 февраля" and similar variants.
         date_like_patterns = [
+            re.compile(
+                r"\b\d{1,2}\s+"
+                r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+                r"[a-z]*\b",
+                re.IGNORECASE,
+            ),
             re.compile(
                 r"\b\d{1,2}\s+"
                 r"(янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек)",
@@ -2248,11 +2540,7 @@ class BookingBot:
         await self._pause(page)
 
     async def _click_seat_canvas(self, page: Page) -> None:
-        locator = page.locator(self.settings.seat_canvas_selector or "canvas")
-        if self.settings.seat_canvas_index is not None:
-            locator = locator.nth(self.settings.seat_canvas_index)
-        else:
-            locator = locator.first
+        locator = await self._seat_canvas_locator(page)
 
         await locator.wait_for(state="visible", timeout=self.settings.default_timeout_ms)
         await locator.scroll_into_view_if_needed()
@@ -2264,6 +2552,50 @@ class BookingBot:
             timeout=self.settings.default_timeout_ms,
         )
         await self._pause(page)
+
+    async def _seat_canvas_locator(self, page: Page) -> Locator:
+        selector = self.settings.seat_canvas_selector or "canvas"
+        locator = page.locator(selector)
+        try:
+            count = await locator.count()
+        except Exception:
+            count = 0
+
+        if count <= 0:
+            return locator.first
+
+        configured_index = self.settings.seat_canvas_index
+        if configured_index is not None:
+            if configured_index < count:
+                return locator.nth(configured_index)
+            LOGGER.warning(
+                "Configured seat canvas index %s is out of range for selector '%s' "
+                "(found %s canvas element(s)); using the last visible canvas.",
+                configured_index,
+                selector,
+                count,
+            )
+        return locator.nth(count - 1)
+
+    async def _dismiss_map_overlays_if_present(self, page: Page) -> None:
+        button_patterns = [
+            re.compile(r"^\s*Continue\s*$", re.IGNORECASE),
+            re.compile(r"^\s*OK\s*$", re.IGNORECASE),
+            re.compile(r"^\s*ОК\s*$", re.IGNORECASE),
+            re.compile(r"^\s*Продолжить\s*$", re.IGNORECASE),
+            re.compile(r"^\s*Понятно\s*$", re.IGNORECASE),
+        ]
+        for pattern in button_patterns:
+            locator = page.get_by_role("button", name=pattern).first
+            try:
+                await locator.wait_for(state="visible", timeout=1_000)
+                LOGGER.info("Dismissing map overlay button matching: %s", pattern.pattern)
+                await self._click_locator(page, locator)
+                return
+            except PlaywrightTimeoutError:
+                continue
+            except Exception:
+                continue
 
     async def _wait_for_office_map_ready(self, page: Page) -> None:
         timeout_ms = self.settings.office_map_wait_timeout_ms
@@ -2279,27 +2611,54 @@ class BookingBot:
                 "Check OFFICE_CHOOSE_SELECTOR/OFFICE_OPTION_SELECTOR_TEMPLATE."
             ) from exc
 
-        ready_locator: Locator | None = None
-        if self.settings.office_map_ready_selector:
-            ready_locator = page.locator(self.settings.office_map_ready_selector).first
-        elif self.settings.seat_canvas_selector:
-            canvas = page.locator(self.settings.seat_canvas_selector)
-            ready_locator = (
-                canvas.nth(self.settings.seat_canvas_index)
-                if self.settings.seat_canvas_index is not None
-                else canvas.first
-            )
-        elif self.settings.booking_params_open_selector:
-            ready_locator = page.locator(self.settings.booking_params_open_selector).first
+        await self._dismiss_map_overlays_if_present(page)
 
-        if ready_locator is not None:
+        ready_locators: list[tuple[str, Locator, int]] = []
+        if self.settings.office_map_ready_selector:
+            ready_locators.append(
+                (
+                    f"configured ready selector '{self.settings.office_map_ready_selector}'",
+                    page.locator(self.settings.office_map_ready_selector).first,
+                    min(timeout_ms, 5_000),
+                )
+            )
+        if self.settings.seat_canvas_selector:
+            ready_locators.append(
+                (
+                    f"seat canvas selector '{self.settings.seat_canvas_selector}'",
+                    await self._seat_canvas_locator(page),
+                    timeout_ms,
+                )
+            )
+        if self.settings.booking_params_open_selector:
+            ready_locators.append(
+                (
+                    f"booking params selector '{self.settings.booking_params_open_selector}'",
+                    page.locator(self.settings.booking_params_open_selector).first,
+                    min(timeout_ms, 10_000),
+                )
+            )
+        if not ready_locators:
+            ready_locators.append(("generic canvas selector 'canvas'", page.locator("canvas").first, timeout_ms))
+
+        ready = False
+        failures: list[str] = []
+        for label, locator, wait_ms in ready_locators:
             try:
-                await ready_locator.wait_for(state="visible", timeout=timeout_ms)
+                await locator.wait_for(state="visible", timeout=wait_ms)
+                LOGGER.info("Office map readiness confirmed by %s.", label)
+                ready = True
+                break
             except PlaywrightTimeoutError as exc:
-                raise RuntimeError(
-                    "Office map did not become ready in time. "
-                    "Tune OFFICE_MAP_READY_SELECTOR/OFFICE_MAP_WAIT_TIMEOUT_MS."
-                ) from exc
+                failures.append(f"{label}: timeout after {wait_ms}ms")
+                continue
+
+        if not ready:
+            raise RuntimeError(
+                "Office map did not become ready in time. "
+                "Tune OFFICE_MAP_READY_SELECTOR/OFFICE_MAP_WAIT_TIMEOUT_MS. "
+                f"Readiness attempts: {'; '.join(failures) or 'n/a'}"
+            )
 
         # Map data is frequently loaded by XHR after URL change, so wait for
         # network quiet as a best-effort sync point.
@@ -2325,6 +2684,8 @@ class BookingBot:
                     continue
             if observed_loader:
                 await self._pause(page)
+
+        await self._dismiss_map_overlays_if_present(page)
 
         if self.settings.office_map_extra_wait_ms > 0:
             await page.wait_for_timeout(self.settings.office_map_extra_wait_ms)
@@ -2543,7 +2904,7 @@ class BookingBot:
             tmp_page = await page.context.new_page()
             tmp_page.set_default_timeout(min(self.settings.default_timeout_ms, 20_000))
             bookings_url = self._build_api_url(page, "/bookings")
-            await tmp_page.goto(bookings_url, wait_until="domcontentloaded")
+            await self._goto_page(tmp_page, bookings_url, purpose="bookings page screenshot")
             try:
                 await tmp_page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:

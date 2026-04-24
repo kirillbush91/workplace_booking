@@ -9,9 +9,12 @@ from unittest.mock import patch
 
 from booking_bot.config import Settings
 from booking_bot.run import (
+    BTN_REAUTH,
+    _build_service_help,
     _build_schedule_preview,
     _compute_catchup_decision,
     _is_healthcheck_due,
+    _menu_keyboard_rows,
     _scheduled_target_date_for_run,
     _settings_for_manual_request,
 )
@@ -86,6 +89,12 @@ class RunHelperTests(unittest.TestCase):
             now_utc,
         )
         self.assertFalse(due_again)
+
+    def test_service_menu_exposes_manual_reauth(self) -> None:
+        rows = _menu_keyboard_rows()
+        flattened = [item for row in rows for item in row]
+        self.assertIn(BTN_REAUTH, flattened)
+        self.assertIn("/reauth", _build_service_help())
 
 
 if __name__ == "__main__":
