@@ -17,12 +17,16 @@ class RuntimeStateStoreTests(unittest.TestCase):
                 last_scheduled_run_local_date="2026-03-02",
                 last_run_status="booked",
                 last_run_mode="scheduled",
+                last_preflight_status="ok",
+                last_preflight_message="office map available",
                 last_healthcheck_local_date="2026-03-02",
             )
             store.save_scheduler_state(state)
             restored = store.load_scheduler_state()
             self.assertEqual(restored.last_scheduled_run_local_date, "2026-03-02")
             self.assertEqual(restored.last_run_status, "booked")
+            self.assertEqual(restored.last_preflight_status, "ok")
+            self.assertEqual(restored.last_preflight_message, "office map available")
             self.assertEqual(restored.last_healthcheck_local_date, "2026-03-02")
 
             now = datetime.now(timezone.utc).isoformat()

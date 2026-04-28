@@ -952,6 +952,36 @@ def _is_preflight_due(
     return True, local_date
 
 
+def _scheduled_preflight_local_date(settings: Settings, scheduled_local_date: date) -> date:
+    schedule_time = _parse_hhmm(settings.schedule_time_local)
+    preflight_time = _parse_hhmm(settings.auth_preflight_time_local)
+    if preflight_time <= schedule_time:
+        return scheduled_local_date
+    return scheduled_local_date - timedelta(days=1)
+
+
+def _scheduled_auth_block_message(
+    settings: Settings,
+    state: SchedulerState,
+    scheduled_local_date: date,
+) -> str | None:
+    if not settings.auth_preflight_enabled:
+        return None
+    expected_preflight_date = _scheduled_preflight_local_date(settings, scheduled_local_date)
+    if state.last_preflight_local_date != expected_preflight_date.isoformat():
+        return None
+    if (state.last_preflight_status or "").lower() == "ok":
+        return None
+
+    status = state.last_preflight_status or "unknown"
+    detail = state.last_preflight_message or "Auth preflight did not finish cleanly."
+    return (
+        f"Scheduled run blocked because auth preflight on "
+        f"{expected_preflight_date.strftime(settings.booking_date_format)} finished with "
+        f"status={status}: {detail}. Send /reauth or tap Re-auth, then run booking manually."
+    )
+
+
 def _is_healthcheck_due(
     settings: Settings,
     state: SchedulerState,
@@ -1262,6 +1292,8 @@ async def _execute_preflight(
         latest_state.last_run_message = summary
         if local_date is not None:
             latest_state.last_preflight_local_date = local_date.isoformat()
+            latest_state.last_preflight_status = status
+            latest_state.last_preflight_message = summary
         latest_state.in_progress_run_id = None
         store.save_scheduler_state(latest_state)
 
@@ -1329,6 +1361,10 @@ async def _execute_reauth(
         latest_state.last_run_status = status
         latest_state.last_run_mode = mode
         latest_state.last_run_message = summary
+        auth_local_date = _schedule_local_now(settings, finished_at).date()
+        latest_state.last_preflight_local_date = auth_local_date.isoformat()
+        latest_state.last_preflight_status = status
+        latest_state.last_preflight_message = summary
         latest_state.in_progress_run_id = None
         store.save_scheduler_state(latest_state)
 
@@ -1718,15 +1754,35 @@ async def run_service(settings: Settings, notifier: InteractiveNotifier) -> int:
                     mark_scheduled_executed=True,
                 )
             else:
-                scheduled_settings = _settings_for_single_date(settings, target)
-                await _execute_booking_run(
-                    scheduled_settings,
-                    notifier,
-                    store,
-                    mode="scheduled",
-                    scheduled_local_date=scheduled_local_date,
-                    target_date=target,
+                latest_state = store.load_scheduler_state()
+                auth_block = _scheduled_auth_block_message(
+                    settings,
+                    latest_state,
+                    scheduled_local_date,
                 )
+                if auth_block:
+                    LOGGER.warning(auth_block)
+                    notifier.send(f"[workplace-booking] {auth_block}", critical=True)
+                    _record_non_booking_result(
+                        settings,
+                        store,
+                        mode="scheduled",
+                        target_date=target,
+                        status="blocked",
+                        summary=auth_block,
+                        scheduled_local_date=scheduled_local_date,
+                        mark_scheduled_executed=True,
+                    )
+                else:
+                    scheduled_settings = _settings_for_single_date(settings, target)
+                    await _execute_booking_run(
+                        scheduled_settings,
+                        notifier,
+                        store,
+                        mode="scheduled",
+                        scheduled_local_date=scheduled_local_date,
+                        target_date=target,
+                    )
             next_run_utc = _next_scheduled_run_utc(settings, now_utc=utc_now() + timedelta(seconds=1))
             continue
 
@@ -1755,15 +1811,36 @@ async def run_service(settings: Settings, notifier: InteractiveNotifier) -> int:
                     mark_catchup_handled=True,
                 )
             else:
-                catchup_settings = _settings_for_single_date(settings, catchup.target_date)
-                await _execute_booking_run(
-                    catchup_settings,
-                    notifier,
-                    store,
-                    mode="scheduled_catchup",
-                    scheduled_local_date=catchup.scheduled_local_date,
-                    target_date=catchup.target_date,
+                latest_state = store.load_scheduler_state()
+                auth_block = _scheduled_auth_block_message(
+                    settings,
+                    latest_state,
+                    catchup.scheduled_local_date,
                 )
+                if auth_block:
+                    LOGGER.warning(auth_block)
+                    notifier.send(f"[workplace-booking] {auth_block}", critical=True)
+                    _record_non_booking_result(
+                        settings,
+                        store,
+                        mode="scheduled_catchup",
+                        target_date=catchup.target_date,
+                        status="blocked",
+                        summary=auth_block,
+                        scheduled_local_date=catchup.scheduled_local_date,
+                        mark_scheduled_executed=True,
+                        mark_catchup_handled=True,
+                    )
+                else:
+                    catchup_settings = _settings_for_single_date(settings, catchup.target_date)
+                    await _execute_booking_run(
+                        catchup_settings,
+                        notifier,
+                        store,
+                        mode="scheduled_catchup",
+                        scheduled_local_date=catchup.scheduled_local_date,
+                        target_date=catchup.target_date,
+                    )
             next_run_utc = _next_scheduled_run_utc(settings, now_utc=utc_now() + timedelta(seconds=1))
             continue
 

@@ -393,7 +393,7 @@ class Settings:
             ),
             auth_preflight_enabled=_env_bool("AUTH_PREFLIGHT_ENABLED", True),
             auth_preflight_time_local=(
-                _env_optional("AUTH_PREFLIGHT_TIME_LOCAL") or "23:50"
+                _env_optional("AUTH_PREFLIGHT_TIME_LOCAL") or "21:00"
             ),
             healthcheck_enabled=_env_bool("HEALTHCHECK_ENABLED", False),
             healthcheck_time_local=(

@@ -15,6 +15,8 @@ from booking_bot.run import (
     _compute_catchup_decision,
     _is_healthcheck_due,
     _menu_keyboard_rows,
+    _scheduled_auth_block_message,
+    _scheduled_preflight_local_date,
     _scheduled_target_date_for_run,
     _settings_for_manual_request,
 )
@@ -39,7 +41,7 @@ class RunHelperTests(unittest.TestCase):
             "BOOKING_DATE_FORMAT": "%d.%m.%Y",
             "BOOKING_SKIP_WEEKENDS": "true",
             "AUTH_PREFLIGHT_ENABLED": "true",
-            "AUTH_PREFLIGHT_TIME_LOCAL": "23:50",
+            "AUTH_PREFLIGHT_TIME_LOCAL": "21:00",
             "HEALTHCHECK_ENABLED": "true",
             "HEALTHCHECK_TIME_LOCAL": "21:00",
             "SCHEDULE_CATCHUP_WINDOW_MINUTES": "360",
@@ -95,6 +97,35 @@ class RunHelperTests(unittest.TestCase):
         flattened = [item for row in rows for item in row]
         self.assertIn(BTN_REAUTH, flattened)
         self.assertIn("/reauth", _build_service_help())
+
+    def test_scheduled_auth_block_uses_previous_evening_preflight(self) -> None:
+        settings = self._settings()
+        scheduled_local_date = date(2026, 4, 29)
+        self.assertEqual(
+            _scheduled_preflight_local_date(settings, scheduled_local_date),
+            date(2026, 4, 28),
+        )
+
+        state = SchedulerState(
+            last_preflight_local_date="2026-04-28",
+            last_preflight_status="warning",
+            last_preflight_message="login required",
+        )
+        message = _scheduled_auth_block_message(settings, state, scheduled_local_date)
+        self.assertIsNotNone(message)
+        self.assertIn("login required", message or "")
+        self.assertIn("/reauth", message or "")
+
+    def test_scheduled_auth_block_allows_successful_reauth(self) -> None:
+        settings = self._settings()
+        state = SchedulerState(
+            last_preflight_local_date="2026-04-28",
+            last_preflight_status="ok",
+            last_preflight_message="Authentication refreshed.",
+        )
+        self.assertIsNone(
+            _scheduled_auth_block_message(settings, state, date(2026, 4, 29))
+        )
 
 
 if __name__ == "__main__":

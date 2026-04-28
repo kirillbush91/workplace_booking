@@ -30,6 +30,8 @@ class SchedulerState:
     catchup_executed_for_local_date: str | None = None
     in_progress_run_id: str | None = None
     last_preflight_local_date: str | None = None
+    last_preflight_status: str | None = None
+    last_preflight_message: str | None = None
     last_healthcheck_local_date: str | None = None
 
     @classmethod
@@ -50,6 +52,8 @@ class SchedulerState:
             ),
             in_progress_run_id=_as_optional_str(raw.get("in_progress_run_id")),
             last_preflight_local_date=_as_optional_str(raw.get("last_preflight_local_date")),
+            last_preflight_status=_as_optional_str(raw.get("last_preflight_status")),
+            last_preflight_message=_as_optional_str(raw.get("last_preflight_message")),
             last_healthcheck_local_date=_as_optional_str(
                 raw.get("last_healthcheck_local_date")
             ),

@@ -387,7 +387,9 @@ This is useful to confirm that the Telegram delivery route is still alive before
   Additional service settings:
   - `SCHEDULE_CATCHUP_WINDOW_MINUTES`: if VPS/container was down at `00:01`, the bot can execute the missed run automatically after restart.
   - `AUTH_PREFLIGHT_ENABLED=true`: run read-only auth/session self-check before the booking window.
-  - `AUTH_PREFLIGHT_TIME_LOCAL=23:50`: preflight time in scheduler local timezone.
+  - `AUTH_PREFLIGHT_TIME_LOCAL=21:00`: preflight time in scheduler local timezone.
+  - If the latest preflight for the upcoming scheduled run finishes with a warning/failure,
+    the scheduled run is blocked instead of starting a login/OTP flow overnight.
   - `HEALTHCHECK_ENABLED=true`: send one Telegram transport health-check message per day.
   - `HEALTHCHECK_TIME_LOCAL=21:00`: health-check time in scheduler local timezone.
   - `RUN_HISTORY_LIMIT`: number of stored run-history entries in `.state/run_history.jsonl`.
