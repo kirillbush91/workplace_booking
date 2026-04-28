@@ -758,7 +758,11 @@ class BookingBot:
             else:
                 LOGGER.warning(
                     "OTP code was not received from Telegram in time. "
-                    "Waiting for manual OTP entry in browser."
+                    "Failing the current run so the service can continue polling commands."
+                )
+                raise RuntimeError(
+                    "OTP step did not complete in time. "
+                    "Reply with an OTP code before timeout or run /reauth to refresh the session."
                 )
         else:
             LOGGER.info(
